@@ -1754,7 +1754,7 @@
   }
 
   function bindRowActions() {
-    document.body.addEventListener("click", (event) => {
+    document.body.addEventListener("click", ansyc (event) => {
       const editEquipment = event.target.closest("[data-edit-equipment]");
       const deleteEquipment = event.target.closest("[data-delete-equipment]");
       const editRoutine = event.target.closest("[data-edit-routine]");
