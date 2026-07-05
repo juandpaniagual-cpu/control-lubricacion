@@ -1,1 +1,2 @@
-/* /index.html 200
+# Sin redirecciones.
+# Cloudflare Workers/Pages sirve index.html directamente.
