@@ -1,0 +1,654 @@
+﻿<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CMMS Local - Lubricación de Equipos</title>
+  <meta name="theme-color" content="#1f4e79">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Lubricación">
+  <link rel="manifest" href="./manifest.webmanifest?v=20260705-loginfix">
+  <link rel="icon" href="./logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css?v=20260705-loginfix">
+</head>
+<body>
+  <section id="loginScreen" class="login-screen">
+    <div class="login-card">
+      <div class="login-brand">
+        <img src="./logo.svg" alt="" width="62" height="62">
+        <div>
+          <p class="eyebrow">CMMS · Lubricación</p>
+          <h1>Ingreso a la app</h1>
+          <p>Acceso por rol para técnicos, supervisores y administración.</p>
+        </div>
+      </div>
+
+      <form id="loginForm" class="login-form">
+        <label>
+          Usuario
+          <input id="loginUser" type="text" autocomplete="username" placeholder="Ej: tecnico" required>
+        </label>
+        <label>
+          Clave / PIN
+          <input id="loginPin" type="password" autocomplete="current-password" placeholder="PIN de acceso" required>
+        </label>
+        <button class="btn btn-primary" type="submit">Ingresar</button>
+      </form>
+
+      <div class="login-help">
+        <p><strong>Usuarios iniciales:</strong> admin/admin123 · supervisor/sup123 · tecnico/tec123 · consulta/ver123</p>
+        <p>Cambia estos accesos antes de usar la app en operación real.</p>
+      </div>
+    </div>
+  </section>
+
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">CMMS local · Mantenimiento</p>
+      <h1>Registro y seguimiento de lubricación</h1>
+      <p class="subtitle">Control de frecuencias, evidencias, SAP/OT, alertas por vencimiento y trazabilidad para auditoría.</p>
+    </div>
+    <div class="header-actions">
+      <div id="currentUserBadge" class="user-badge"></div>
+      <button id="btnInstallApp" class="btn btn-secondary hidden" type="button">Instalar app</button>
+      <button id="btnNotify" class="btn btn-secondary" type="button">Activar alertas</button>
+      <button id="btnExportJson" class="btn btn-primary" type="button">Exportar respaldo</button>
+      <button id="btnLogout" class="btn btn-secondary" type="button">Salir</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <button class="nav-btn active" data-view="dashboard">Dashboard</button>
+      <button class="nav-btn" data-view="registro">Registrar ejecución</button>
+      <button class="nav-btn" data-view="plan">Plan maestro</button>
+      <button class="nav-btn" data-view="historico">Histórico</button>
+      <button class="nav-btn" data-view="equipos">Equipos</button>
+      <button class="nav-btn" data-view="rutinas">Rutinas</button>
+      <button class="nav-btn" data-view="usuarios">Usuarios</button>
+      <button class="nav-btn" data-view="config">Configuración</button>
+    </aside>
+
+    <section class="content">
+      <section id="dashboard" class="view active">
+        <div class="section-title">
+          <div>
+            <h2>Dashboard de lubricación</h2>
+            <p>Resumen del estado actual del plan calculado con base en las ejecuciones registradas.</p>
+          </div>
+          <button id="btnExportAlerts" class="btn btn-secondary" type="button">Exportar alertas CSV</button>
+        </div>
+
+        <div class="panel dashboard-filters">
+          <label>
+            Estado
+            <select id="dashboardStatusFilter">
+              <option value="">Todos</option>
+              <option value="VENCIDO">Vencido</option>
+              <option value="VENCE HOY">Vence hoy</option>
+              <option value="PROXIMO">Próximo</option>
+              <option value="VIGENTE">Vigente</option>
+            </select>
+          </label>
+          <label>
+            Equipo
+            <select id="dashboardEquipmentFilter"></select>
+          </label>
+          <label>
+            Rutina
+            <select id="dashboardRoutineFilter"></select>
+          </label>
+          <div class="filter-actions">
+            <button id="btnDashboardClear" class="btn btn-secondary" type="button">Limpiar filtros</button>
+          </div>
+        </div>
+
+        <div class="cards" id="dashboardCards"></div>
+
+        <div class="dashboard-grid">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Estado por equipo</h3>
+              <p>Distribución de rutinas vigentes y pendientes.</p>
+            </div>
+            <div id="equipmentChart" class="bar-chart"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Últimas ejecuciones</h3>
+              <p>Registros más recientes del histórico.</p>
+            </div>
+            <div id="recentRecords" class="recent-list"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Plan filtrado / alertas</h3>
+            <p>Haz clic en una tarjeta o usa los filtros para analizar el plan.</p>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Estado</th>
+                  <th>Días</th>
+                  <th>Próxima fecha</th>
+                  <th>Equipo</th>
+                  <th>Rutina</th>
+                  <th>Responsable</th>
+                  <th>SAP/OT</th>
+                </tr>
+              </thead>
+              <tbody id="alertsTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="registro" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Registrar ejecución</h2>
+            <p>Registro rápido por turno. Si la actividad fue urgente, dejar el ID local y luego conciliar con SAP.</p>
+          </div>
+        </div>
+
+        <form id="executionForm" class="form-grid panel">
+          <label>
+            Equipo
+            <select id="recordEquipment" required></select>
+          </label>
+          <label>
+            Rutina
+            <select id="recordRoutine" required></select>
+          </label>
+          <label>
+            Fecha ejecución
+            <input id="recordDate" type="date" required>
+          </label>
+          <label>
+            Hora
+            <input id="recordTime" type="time">
+          </label>
+          <label>
+            Turno
+            <select id="recordShift">
+              <option>Turno 1</option>
+              <option>Turno 2</option>
+              <option>Turno 3</option>
+            </select>
+          </label>
+          <label>
+            Técnico
+            <input id="recordTechnician" type="text" placeholder="Nombre del técnico">
+          </label>
+          <label>
+            Estado ejecución
+            <select id="recordStatus">
+              <option>Ejecutado</option>
+              <option>Parcial</option>
+              <option>No ejecutado</option>
+              <option>Reprogramado</option>
+            </select>
+          </label>
+          <label>
+            Horómetro
+            <input id="recordHourmeter" type="number" min="0" step="0.1" placeholder="Opcional">
+          </label>
+          <label>
+            Lubricante / aceite
+            <input id="recordLubricant" type="text" placeholder="Ej: Nevastane XS 80">
+          </label>
+          <label>
+            Cantidad aplicada
+            <input id="recordQuantity" type="text" placeholder="Ej: 20 g / punto">
+          </label>
+          <label>
+            Equipo detenido / LOTO
+            <select id="recordLoto">
+              <option>Sí</option>
+              <option>No</option>
+              <option>No aplica</option>
+            </select>
+          </label>
+          <label>
+            Condición aceite
+            <select id="recordOilCondition">
+              <option>No aplica</option>
+              <option>Normal</option>
+              <option>Bajo nivel</option>
+              <option>Contaminado</option>
+              <option>Con fuga</option>
+              <option>Requiere cambio</option>
+            </select>
+          </label>
+          <label>
+            Aviso SAP
+            <input id="recordSapNotice" type="text" placeholder="Aviso SAP">
+          </label>
+          <label>
+            OT SAP
+            <input id="recordSapOrder" type="text" placeholder="Orden SAP">
+          </label>
+          <label>
+            Evidencia / foto
+            <input id="recordEvidence" type="text" placeholder="Ruta, link o nombre de archivo">
+          </label>
+          <label>
+            Supervisor
+            <input id="recordSupervisor" type="text" placeholder="Nombre supervisor">
+          </label>
+          <label class="span-2">
+            Hallazgos
+            <textarea id="recordFindings" rows="3" placeholder="Condición encontrada, fugas, ruido, temperatura, vibración, suciedad, acceso, etc."></textarea>
+          </label>
+          <label class="span-2">
+            Acción correctiva / observaciones
+            <textarea id="recordAction" rows="3" placeholder="Acción realizada, recomendación, repuesto requerido o justificación si no se ejecutó."></textarea>
+          </label>
+          <div class="form-actions span-2">
+            <button class="btn btn-primary" type="submit">Guardar registro</button>
+            <button id="btnClearRecord" class="btn btn-secondary" type="button">Limpiar</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="plan" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Plan maestro y alertas</h2>
+            <p>La app cruza todos los equipos activos con las rutinas aplicables y calcula vencimientos.</p>
+          </div>
+          <div class="inline-actions">
+            <select id="planStatusFilter">
+              <option value="">Todos los estados</option>
+              <option value="VENCIDO">Vencido</option>
+              <option value="VENCE HOY">Vence hoy</option>
+              <option value="PROXIMO">Próximo</option>
+              <option value="VIGENTE">Vigente</option>
+            </select>
+            <button id="btnExportPlan" class="btn btn-secondary" type="button">Exportar plan CSV</button>
+          </div>
+        </div>
+
+        <div class="table-wrap panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Estado</th>
+                <th>Días</th>
+                <th>Equipo</th>
+                <th>Familia</th>
+                <th>Rutina</th>
+                <th>Frecuencia</th>
+                <th>Última ejecución</th>
+                <th>Próxima fecha</th>
+                <th>Procedimiento</th>
+                <th>Responsable</th>
+              </tr>
+            </thead>
+            <tbody id="planTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="historico" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Histórico de ejecuciones</h2>
+            <p>Bitácora trazable para análisis, auditoría y conciliación con SAP.</p>
+          </div>
+          <button id="btnExportRecords" class="btn btn-secondary" type="button">Exportar histórico CSV</button>
+        </div>
+        <div class="table-wrap panel">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Fecha</th>
+                <th>Equipo</th>
+                <th>Rutina</th>
+                <th>Estado</th>
+                <th>Turno</th>
+                <th>Técnico</th>
+                <th>SAP</th>
+                <th>Hallazgos</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="recordsTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="equipos" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Equipos</h2>
+            <p>Lista maestra local. Puede alinearse después con códigos SAP, centros de costo y sistemas/subsistemas.</p>
+          </div>
+        </div>
+
+        <form id="equipmentForm" class="form-grid panel">
+          <input id="equipmentId" type="hidden">
+          <label>
+            Código equipo
+            <input id="equipmentCode" type="text" required placeholder="Ej: 30M001">
+          </label>
+          <label>
+            Nombre
+            <input id="equipmentName" type="text" required placeholder="Ej: Centrífuga horizontal">
+          </label>
+          <label>
+            Área
+            <input id="equipmentArea" type="text" placeholder="Ej: Hipocalcio">
+          </label>
+          <label>
+            Sistema
+            <input id="equipmentSystem" type="text" placeholder="Ej: Centrifugación">
+          </label>
+          <label>
+            Subsistema
+            <input id="equipmentSubsystem" type="text" placeholder="Ej: Decantación">
+          </label>
+          <label>
+            Familia
+            <select id="equipmentFamily">
+              <option>Centrífugas</option>
+              <option>Bombas</option>
+              <option>Chillers</option>
+              <option>Compresores</option>
+              <option>Empaque</option>
+              <option>Motores</option>
+              <option>General</option>
+            </select>
+          </label>
+          <label>
+            Criticidad
+            <select id="equipmentCriticality">
+              <option>Alta</option>
+              <option>Media</option>
+              <option>Baja</option>
+            </select>
+          </label>
+          <label>
+            Centro de costo
+            <input id="equipmentCostCenter" type="text" placeholder="Ej: CC-01">
+          </label>
+          <div class="form-actions span-2">
+            <button class="btn btn-primary" type="submit">Guardar equipo</button>
+            <button id="btnClearEquipment" class="btn btn-secondary" type="button">Nuevo equipo</button>
+          </div>
+        </form>
+
+        <div class="table-wrap panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Código</th>
+                <th>Nombre</th>
+                <th>Área</th>
+                <th>Familia</th>
+                <th>Criticidad</th>
+                <th>Centro costo</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="equipmentTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="rutinas" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Rutinas</h2>
+            <p>Define frecuencias por familia de equipo. Las rutinas de centrífugas ya quedan precargadas.</p>
+          </div>
+        </div>
+
+        <form id="routineForm" class="form-grid panel">
+          <input id="routineId" type="hidden">
+          <label>
+            Código rutina
+            <input id="routineCode" type="text" required placeholder="Ej: R1">
+          </label>
+          <label>
+            Nombre
+            <input id="routineName" type="text" required placeholder="Ej: Rutina 1">
+          </label>
+          <label>
+            Aplica a familia
+            <select id="routineScope">
+              <option>Todos</option>
+              <option>Centrífugas</option>
+              <option>Bombas</option>
+              <option>Chillers</option>
+              <option>Compresores</option>
+              <option>Empaque</option>
+              <option>Motores</option>
+              <option>General</option>
+            </select>
+          </label>
+          <label>
+            Frecuencia días
+            <input id="routineFrequency" type="number" min="1" required placeholder="Ej: 30">
+          </label>
+          <label>
+            Frecuencia texto
+            <input id="routineFrequencyText" type="text" placeholder="Ej: Mensual">
+          </label>
+          <label>
+            Responsable
+            <input id="routineResponsible" type="text" placeholder="Ej: Técnico mecánico">
+          </label>
+          <label>
+            Lubricante / aceite
+            <input id="routineLubricant" type="text" placeholder="Ej: Nevastane XS 80">
+          </label>
+          <label>
+            Requiere LOTO
+            <select id="routineLoto">
+              <option>Sí</option>
+              <option>No</option>
+              <option>Según condición</option>
+            </select>
+          </label>
+          <label class="span-2">
+            Actividad
+            <textarea id="routineDescription" rows="3" placeholder="Descripción técnica de la rutina"></textarea>
+          </label>
+          <label class="span-2">
+            Procedimiento / referencia
+            <input id="routineProcedure" type="text" placeholder="Procedimiento, manual o estándar">
+          </label>
+          <div class="form-actions span-2">
+            <button class="btn btn-primary" type="submit">Guardar rutina</button>
+            <button id="btnClearRoutine" class="btn btn-secondary" type="button">Nueva rutina</button>
+          </div>
+        </form>
+
+        <div class="table-wrap panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Código</th>
+                <th>Rutina</th>
+                <th>Aplica a</th>
+                <th>Frecuencia</th>
+                <th>Lubricante</th>
+                <th>Procedimiento</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="routinesTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="usuarios" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Usuarios y permisos</h2>
+            <p>Alta de técnicos, supervisores y perfiles de consulta. Esta gestión es local para esta versión.</p>
+          </div>
+        </div>
+
+        <div class="permissions-grid">
+          <article class="panel">
+            <h3>Administrador</h3>
+            <p>Acceso total: usuarios, configuración, equipos, rutinas, registros, exportaciones e importaciones.</p>
+          </article>
+          <article class="panel">
+            <h3>Supervisor</h3>
+            <p>Puede registrar, revisar histórico, exportar reportes y dar seguimiento al plan.</p>
+          </article>
+          <article class="panel">
+            <h3>Técnico</h3>
+            <p>Puede registrar ejecuciones, consultar dashboard y revisar el plan asignado.</p>
+          </article>
+          <article class="panel">
+            <h3>Consulta</h3>
+            <p>Solo lectura para auditoría, gerencia o revisión de indicadores.</p>
+          </article>
+        </div>
+
+        <form id="userForm" class="form-grid panel">
+          <input id="userId" type="hidden">
+          <label>
+            Nombre
+            <input id="userName" type="text" required placeholder="Nombre completo">
+          </label>
+          <label>
+            Usuario
+            <input id="userUsername" type="text" required placeholder="Ej: jperez">
+          </label>
+          <label>
+            Rol
+            <select id="userRole">
+              <option value="admin">Administrador</option>
+              <option value="supervisor">Supervisor</option>
+              <option value="tecnico">Técnico</option>
+              <option value="consulta">Consulta</option>
+            </select>
+          </label>
+          <label>
+            PIN / clave
+            <input id="userPin" type="text" required placeholder="PIN temporal">
+          </label>
+          <label>
+            Estado
+            <select id="userActive">
+              <option value="true">Activo</option>
+              <option value="false">Inactivo</option>
+            </select>
+          </label>
+          <label>
+            Turno / observación
+            <input id="userNote" type="text" placeholder="Ej: Turno 1 / mecánico">
+          </label>
+          <div class="form-actions span-2">
+            <button class="btn btn-primary" type="submit">Guardar usuario</button>
+            <button id="btnClearUser" class="btn btn-secondary" type="button">Nuevo usuario</button>
+          </div>
+        </form>
+
+        <div class="table-wrap panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Nombre</th>
+                <th>Usuario</th>
+                <th>Rol</th>
+                <th>Estado</th>
+                <th>Observación</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="usersTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="config" class="view">
+        <div class="section-title">
+          <div>
+            <h2>Configuración y respaldo</h2>
+            <p>Parámetros generales del control local.</p>
+          </div>
+        </div>
+
+        <form id="configForm" class="form-grid panel">
+          <label>
+            Fecha base si no hay registros
+            <input id="configBaseDate" type="date">
+          </label>
+          <label>
+            Días de prealerta
+            <input id="configPrealert" type="number" min="1" max="60">
+          </label>
+          <label>
+            Planta / área
+            <input id="configSite" type="text">
+          </label>
+          <label>
+            Sistema maestro
+            <input id="configMaster" type="text" placeholder="SAP">
+          </label>
+          <div class="form-actions span-2">
+            <button class="btn btn-primary" type="submit">Guardar configuración</button>
+          </div>
+        </form>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Respaldo / restauración</h3>
+            <p>Útil para mover información entre equipos o guardar evidencia mensual.</p>
+          </div>
+          <div class="inline-actions">
+            <button id="btnExportJson2" class="btn btn-secondary" type="button">Exportar JSON</button>
+            <label class="file-btn">
+              Importar JSON
+              <input id="importJson" type="file" accept=".json,application/json">
+            </label>
+            <button id="btnSeedDemo" class="btn btn-danger" type="button">Cargar datos del Excel actualizado</button>
+          </div>
+          <p class="note">Nota: esta versión guarda en el navegador. Para operación multiusuario de planta conviene pasarla a servidor con base de datos y usuarios.</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="./app.js?v=20260705-loginfix"></script>
+  <script>
+    // Respaldo de ingreso: si una versión anterior del JS quedó en caché o falla antes de enlazar el formulario,
+    // este bloque permite desbloquear la app con los usuarios iniciales.
+    (() => {
+      const users = {
+        admin: { id: "USR-ADMIN", name: "Administrador", username: "admin", pin: "admin123", role: "admin" },
+        supervisor: { id: "USR-SUPERVISOR", name: "Supervisor mantenimiento", username: "supervisor", pin: "sup123", role: "supervisor" },
+        tecnico: { id: "USR-TECNICO", name: "Técnico de turno", username: "tecnico", pin: "tec123", role: "tecnico" },
+        consulta: { id: "USR-CONSULTA", name: "Usuario consulta", username: "consulta", pin: "ver123", role: "consulta" },
+      };
+      const form = document.getElementById("loginForm");
+      if (!form || form.dataset.fallbackBound === "true") return;
+      form.dataset.fallbackBound = "true";
+      form.addEventListener("submit", (event) => {
+        const username = document.getElementById("loginUser")?.value.trim().toLowerCase();
+        const pin = document.getElementById("loginPin")?.value.trim();
+        const user = users[username];
+        if (!user || user.pin !== pin) return;
+        localStorage.setItem("cmms_lubricacion_session_v1", user.id);
+        document.body.classList.remove("locked");
+        document.getElementById("loginScreen")?.classList.add("hidden");
+        const badge = document.getElementById("currentUserBadge");
+        if (badge && !badge.textContent) badge.textContent = `${user.name} · ${user.role}`;
+      }, true);
+    })();
+  </script>
+</body>
+</html>
+

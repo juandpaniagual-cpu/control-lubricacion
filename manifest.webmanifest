@@ -1,0 +1,20 @@
+{
+  "name": "CMMS Lubricación Planta",
+  "short_name": "Lubricación",
+  "description": "Registro, seguimiento y alertas de rutinas de lubricación de equipos.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f7fb",
+  "theme_color": "#1f4e79",
+  "categories": ["business", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "./logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

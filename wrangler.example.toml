@@ -1,0 +1,8 @@
+name = "cmms-lubricacion"
+compatibility_date = "2026-07-05"
+pages_build_output_dir = "."
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cmms-lubricacion-db"
+database_id = "REEMPLAZAR_CON_DATABASE_ID_DE_CLOUDFLARE_D1"
