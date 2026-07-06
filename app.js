@@ -668,7 +668,7 @@ window.CMMS_SEED_DATA = {
 (function () {
   const STORAGE_KEY = "cmms_lubricacion_local_v1";
   const API_BASE = "./api";
-  const APP_VERSION = "2026-07-06-d1-access-request-v3-install-inside";
+  const APP_VERSION = "2026-07-06-d1-access-request-v4-login-note-layout";
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -1018,8 +1018,12 @@ window.CMMS_SEED_DATA = {
       help = document.createElement("div");
       help.id = "loginAccessHelp";
       help.style.cssText = "margin-top:12px;padding:12px;border-radius:14px;background:#fff7ed;color:#7c2d12;font-size:13px;line-height:1.35;border:1px solid #fed7aa;display:none;";
-      form.insertAdjacentElement("afterend", help);
     }
+
+    const note = $("#loginRequestNote");
+    if (note) note.insertAdjacentElement("afterend", help);
+    else form.insertAdjacentElement("afterend", help);
+
     return help;
   }
 
@@ -1065,18 +1069,29 @@ window.CMMS_SEED_DATA = {
     const form = $("#loginForm");
     if (!screen || !form) return;
 
-    const candidates = Array.from(screen.querySelectorAll("div, p, small, section, article"));
-    const initialNote = candidates.find((node) => node.textContent.includes("Usuarios iniciales"));
-    if (initialNote) {
-      initialNote.innerHTML = loginInstallNoteHtml();
-      initialNote.classList.add("access-request-note");
-      initialNote.style.lineHeight = "1.45";
-    } else if (!$("#loginRequestNote")) {
-      const note = document.createElement("div");
+    // IMPORTANTE:
+    // En algunas versiones el texto "Usuarios iniciales" queda dentro del contenedor padre
+    // que también contiene el formulario. Si reemplazamos ese padre, desaparecen el campo
+    // de usuario y el botón. Por eso solo reemplazamos nodos que NO contengan el formulario.
+    const candidates = Array.from(screen.querySelectorAll("div, p, small, section, article"))
+      .filter((node) => node.textContent.includes("Usuarios iniciales") && !node.contains(form));
+
+    const initialNote = candidates.sort((a, b) => a.textContent.length - b.textContent.length)[0];
+
+    let note = $("#loginRequestNote") || initialNote;
+    if (!note) {
+      note = document.createElement("div");
       note.id = "loginRequestNote";
-      note.className = "access-request-note";
-      note.style.cssText = "margin-top:16px;padding:14px;border-radius:16px;background:rgba(31,76,126,.72);color:#fff;line-height:1.45;font-size:14px;";
-      note.innerHTML = loginInstallNoteHtml();
+      form.insertAdjacentElement("afterend", note);
+    }
+
+    note.id = "loginRequestNote";
+    note.className = "access-request-note";
+    note.style.cssText = "margin-top:16px;padding:14px;border-radius:16px;background:rgba(31,76,126,.72);color:#fff;line-height:1.45;font-size:14px;";
+    note.innerHTML = loginInstallNoteHtml();
+
+    // Asegura que el formulario quede arriba y la nota abajo, ambos visibles en la misma pantalla.
+    if (note.previousElementSibling !== form) {
       form.insertAdjacentElement("afterend", note);
     }
   }
@@ -1091,8 +1106,13 @@ window.CMMS_SEED_DATA = {
       const style = document.createElement("style");
       style.id = "accessRequestLoginStyle";
       style.textContent = `
-        #loginAccessHelp { margin-top:12px;padding:12px;border-radius:14px;background:#fff7ed;color:#7c2d12;font-size:13px;line-height:1.35;border:1px solid #fed7aa; }
+        #loginScreen .hidden { display:none !important; }
+        #loginForm { display:block !important; }
+        #loginForm .admin-pin-hidden,
+        #loginForm.admin-pin-hidden,
         .admin-pin-hidden { display:none !important; }
+        #loginAccessHelp { margin-top:12px;padding:12px;border-radius:14px;background:#fff7ed;color:#7c2d12;font-size:13px;line-height:1.35;border:1px solid #fed7aa; }
+        #loginRequestNote.access-request-note { display:block !important; margin-top:16px; }
         .install-app-inline-btn { display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:9px 12px;font-weight:800; }
       `;
       document.head.appendChild(style);
