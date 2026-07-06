@@ -41,6 +41,54 @@ async function run(db, sql, params = []) {
   return await db.prepare(sql).bind(...params).run();
 }
 
+
+async function ensureAccessRequestsSchema(db) {
+  await run(
+    db,
+    `CREATE TABLE IF NOT EXISTS access_requests (
+      id TEXT PRIMARY KEY,
+      requested_name TEXT NOT NULL,
+      username TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      device_label TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      user_id TEXT DEFAULT '',
+      role TEXT DEFAULT 'consulta',
+      detail TEXT DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`
+  );
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_access_requests_status ON access_requests (status, created_at)");
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_access_requests_device ON access_requests (device_id, created_at)");
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_access_requests_username ON access_requests (username, created_at)");
+}
+
+function normalizeUsername(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function accessRequest(row) {
+  return {
+    id: row.id,
+    requestedName: row.requested_name || "",
+    username: row.username || "",
+    deviceId: row.device_id || "",
+    deviceLabel: row.device_label || "",
+    status: row.status || "pending",
+    userId: row.user_id || "",
+    role: row.role || "consulta",
+    detail: row.detail || "",
+    createdAt: row.created_at || "",
+    updatedAt: row.updated_at || "",
+  };
+}
+
+async function listAccessRequests(db) {
+  await ensureAccessRequestsSchema(db);
+  return (await all(db, "SELECT * FROM access_requests ORDER BY created_at DESC LIMIT 100")).map(accessRequest);
+}
+
 async function logDeviceEvent(db, data) {
   try {
     await run(
@@ -157,6 +205,7 @@ function record(row) {
 }
 
 async function bootstrap(db) {
+  await ensureAccessRequestsSchema(db);
   const settings = await all(db, "SELECT key, value FROM app_settings");
   const cfg = Object.fromEntries(settings.map((r) => [r.key, r.value]));
   const equipmentRows = await all(db, "SELECT * FROM equipment ORDER BY code");
@@ -185,6 +234,7 @@ async function bootstrap(db) {
     planAssignments: planRows.map(assignment),
     records: recordRows.map(record),
     users: userRows.map(user),
+    accessRequests: await listAccessRequests(db),
   };
 }
 
@@ -346,6 +396,178 @@ async function login(db, data) {
   return { user: user(updated) };
 }
 
+
+async function requestAccess(db, data) {
+  await ensureAccessRequestsSchema(db);
+  const requestedName = String(data.name || data.username || "").trim().replace(/\s+/g, " ");
+  const username = normalizeUsername(data.username || requestedName);
+  const deviceId = String(data.deviceId || "").trim();
+  const deviceLabel = String(data.deviceLabel || "Equipo sin identificar").slice(0, 180);
+
+  if (!requestedName || !username) {
+    return { response: error("Nombre de usuario requerido", 400, { code: "NAME_REQUIRED" }) };
+  }
+  if (!deviceId) {
+    return { response: error("No se pudo identificar este equipo", 400, { code: "DEVICE_REQUIRED" }) };
+  }
+  if (["admin", "administrador"].includes(username)) {
+    return { response: error("El administrador debe ingresar con PIN", 400, { code: "ADMIN_PIN_REQUIRED" }) };
+  }
+
+  const now = new Date().toISOString();
+  const row = await first(
+    db,
+    "SELECT * FROM users WHERE active = 1 AND (lower(username) = ? OR lower(name) = ?) LIMIT 1",
+    [username, username]
+  );
+
+  if (row) {
+    if (row.role === "admin") {
+      return { response: error("El administrador debe ingresar con PIN", 400, { code: "ADMIN_PIN_REQUIRED" }) };
+    }
+
+    if (row.authorized_device_id && row.authorized_device_id === deviceId) {
+      await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
+      await logDeviceEvent(db, {
+        userId: row.id,
+        username: row.username,
+        deviceId,
+        deviceLabel,
+        eventType: "LOGIN_OK_NAME_ONLY",
+        detail: "Ingreso por nombre desde equipo autorizado.",
+      });
+      const updated = await first(
+        db,
+        `SELECT id, name, username, role, note, active,
+                authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+           FROM users WHERE id = ?`,
+        [row.id]
+      );
+      return { status: "APPROVED", user: user(updated) };
+    }
+
+    if (row.authorized_device_id && row.authorized_device_id !== deviceId) {
+      await logDeviceEvent(db, {
+        userId: row.id,
+        username: row.username,
+        deviceId,
+        deviceLabel,
+        eventType: "DENIED_DIFFERENT_DEVICE_NAME_ONLY",
+        detail: `Intento por nombre desde equipo diferente. Equipo autorizado: ${row.authorized_device_label || row.authorized_device_id}`,
+      });
+      return {
+        response: error("Usuario autorizado en otro equipo", 403, {
+          code: "DEVICE_LOCKED",
+          username: row.username,
+          authorizedDeviceLabel: row.authorized_device_label || "Equipo autorizado previamente",
+          authorizedDeviceAt: row.authorized_device_at || "",
+        }),
+      };
+    }
+
+    const existing = await first(
+      db,
+      "SELECT * FROM access_requests WHERE user_id = ? AND device_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+      [row.id, deviceId]
+    );
+    if (!existing) {
+      await run(
+        db,
+        `INSERT INTO access_requests (id, requested_name, username, device_id, device_label, status, user_id, role, detail, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+        [makeId("REQ"), requestedName, row.username, deviceId, deviceLabel, row.id, row.role || "consulta", "Pendiente de autorización del administrador.", now, now]
+      );
+    }
+    return { status: "PENDING", accessRequests: await listAccessRequests(db) };
+  }
+
+  const existing = await first(
+    db,
+    "SELECT * FROM access_requests WHERE lower(username) = ? AND device_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+    [username, deviceId]
+  );
+  if (!existing) {
+    await run(
+      db,
+      `INSERT INTO access_requests (id, requested_name, username, device_id, device_label, status, role, detail, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', 'consulta', ?, ?, ?)`,
+      [makeId("REQ"), requestedName, username, deviceId, deviceLabel, "Usuario no existente; al aprobar se creará como consulta.", now, now]
+    );
+  }
+  return { status: "PENDING", accessRequests: await listAccessRequests(db) };
+}
+
+async function approveAccessRequest(db, id, data = {}) {
+  await ensureAccessRequestsSchema(db);
+  const req = await first(db, "SELECT * FROM access_requests WHERE id = ?", [id]);
+  if (!req) throw new Error("Solicitud no encontrada");
+  if (req.status !== "pending") return { request: accessRequest(req), accessRequests: await listAccessRequests(db) };
+
+  const now = new Date().toISOString();
+  const requestedName = String(req.requested_name || req.username || "Usuario autorizado").trim();
+  const username = normalizeUsername(req.username || requestedName);
+  const role = String(data.role || req.role || "consulta").trim() || "consulta";
+
+  let existingUser = req.user_id ? await first(db, "SELECT * FROM users WHERE id = ?", [req.user_id]) : null;
+  if (!existingUser) {
+    existingUser = await first(db, "SELECT * FROM users WHERE lower(username) = ? OR lower(name) = ? LIMIT 1", [username, username]);
+  }
+
+  let userId;
+  if (existingUser) {
+    userId = existingUser.id;
+    await run(
+      db,
+      `UPDATE users
+          SET active = 1,
+              authorized_device_id = ?, authorized_device_label = ?, authorized_device_at = ?, updated_at = ?
+        WHERE id = ?`,
+      [req.device_id, req.device_label || "", now, now, userId]
+    );
+  } else {
+    userId = makeId("USR");
+    await run(
+      db,
+      `INSERT INTO users (id, name, username, pin, role, note, active,
+                          authorized_device_id, authorized_device_label, authorized_device_at, last_login_at, created_at, updated_at)
+       VALUES (?, ?, ?, '', ?, ?, 1, ?, ?, ?, '', ?, ?)`,
+      [userId, requestedName, username, role, "Creado por solicitud de acceso aprobada.", req.device_id, req.device_label || "", now, now, now]
+    );
+  }
+
+  await run(
+    db,
+    "UPDATE access_requests SET status = 'approved', user_id = ?, detail = ?, updated_at = ? WHERE id = ?",
+    [userId, "Solicitud aprobada por administrador.", now, id]
+  );
+  await logDeviceEvent(db, {
+    userId,
+    username,
+    deviceId: req.device_id,
+    deviceLabel: req.device_label || "",
+    eventType: "ACCESS_REQUEST_APPROVED",
+    detail: "Equipo autorizado por solicitud de acceso.",
+  });
+
+  const updated = await first(
+    db,
+    `SELECT id, name, username, role, note, active,
+            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+       FROM users WHERE id = ?`,
+    [userId]
+  );
+  return { user: user(updated), accessRequests: await listAccessRequests(db) };
+}
+
+async function denyAccessRequest(db, id) {
+  await ensureAccessRequestsSchema(db);
+  const req = await first(db, "SELECT * FROM access_requests WHERE id = ?", [id]);
+  if (!req) throw new Error("Solicitud no encontrada");
+  const now = new Date().toISOString();
+  await run(db, "UPDATE access_requests SET status = 'denied', detail = ?, updated_at = ? WHERE id = ?", ["Solicitud negada por administrador.", now, id]);
+  return { accessRequests: await listAccessRequests(db) };
+}
+
 async function releaseDevice(db, id) {
   const row = await first(db, "SELECT * FROM users WHERE id = ?", [id]);
   if (!row) throw new Error("Usuario no encontrado");
@@ -392,6 +614,26 @@ export async function onRequest({ request, env }) {
       const result = await login(db, await bodyJson(request));
       if (result.response) return result.response;
       return json({ ok: true, user: result.user });
+    }
+
+    if (method === "POST" && path === "/api/auth/request-access") {
+      const result = await requestAccess(db, await bodyJson(request));
+      if (result.response) return result.response;
+      return json({ ok: true, ...result }, result.status === "PENDING" ? 202 : 200);
+    }
+
+    if (method === "GET" && path === "/api/access-requests") {
+      return json({ ok: true, accessRequests: await listAccessRequests(db) });
+    }
+
+    if (method === "POST" && path.startsWith("/api/access-requests/") && path.endsWith("/approve")) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      return json({ ok: true, ...(await approveAccessRequest(db, id, await bodyJson(request))) });
+    }
+
+    if (method === "POST" && path.startsWith("/api/access-requests/") && path.endsWith("/deny")) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      return json({ ok: true, ...(await denyAccessRequest(db, id)) });
     }
 
     if (method === "GET" && path === "/api/equipment") {
