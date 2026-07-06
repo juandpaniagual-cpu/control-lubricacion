@@ -668,7 +668,7 @@ window.CMMS_SEED_DATA = {
 (function () {
   const STORAGE_KEY = "cmms_lubricacion_local_v1";
   const API_BASE = "./api";
-  const APP_VERSION = "2026-07-06-d1-device-access-v1";
+  const APP_VERSION = "2026-07-06-d1-access-request-v2";
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -922,6 +922,7 @@ window.CMMS_SEED_DATA = {
         planAssignments: Array.isArray(data.planAssignments) ? data.planAssignments : defaults.planAssignments,
         records: Array.isArray(data.records) ? data.records : [],
         users: Array.isArray(data.users) ? data.users : defaults.users,
+        accessRequests: Array.isArray(data.accessRequests) ? data.accessRequests : [],
       };
     } catch (error) {
       console.error(error);
@@ -1022,13 +1023,13 @@ window.CMMS_SEED_DATA = {
     return help;
   }
 
-  function showAccessMessage(message) {
+  function showAccessMessage(message, toastMessage = "Solicitud enviada. Espera autorización del administrador.") {
     const help = ensureAccessHelp();
     if (help) {
       help.innerHTML = message;
       help.style.display = "block";
     }
-    toast("Equipo no autorizado. Solicita acceso al administrador.");
+    if (toastMessage) toast(toastMessage);
   }
 
   function clearAccessMessage() {
@@ -1037,6 +1038,97 @@ window.CMMS_SEED_DATA = {
       help.textContent = "";
       help.style.display = "none";
     }
+  }
+
+
+  function normalizeAccessName(value) {
+    return String(value || "").trim().replace(/\s+/g, " ");
+  }
+
+  function isAdminLoginName(value) {
+    return ["admin", "administrador"].includes(String(value || "").trim().toLowerCase());
+  }
+
+  function loginInstallNoteHtml() {
+    return `
+      <strong>Solicitud de acceso</strong><br>
+      Escribe tu nombre o usuario y presiona <strong>Solicitar acceso</strong>.
+      El administrador aprobará el ingreso desde la app.<br>
+      <strong>Importante:</strong> este acceso queda vinculado a un solo celular o computador.
+      Si cambias de equipo, deberás solicitar autorización nuevamente.<br>
+      <button id="btnInstallLogin" class="mini-btn" type="button" style="margin-top:10px;background:#ffffff;color:#1d4ed8;border:1px solid rgba(255,255,255,.7);font-weight:800;">
+        Instalar app en este celular
+      </button>
+    `;
+  }
+
+  function replaceLoginInitialUsersNote() {
+    const screen = $("#loginScreen");
+    const form = $("#loginForm");
+    if (!screen || !form) return;
+
+    const candidates = Array.from(screen.querySelectorAll("div, p, small, section, article"));
+    const initialNote = candidates.find((node) => node.textContent.includes("Usuarios iniciales"));
+    if (initialNote) {
+      initialNote.innerHTML = loginInstallNoteHtml();
+      initialNote.classList.add("access-request-note");
+      initialNote.style.lineHeight = "1.45";
+    } else if (!$("#loginRequestNote")) {
+      const note = document.createElement("div");
+      note.id = "loginRequestNote";
+      note.className = "access-request-note";
+      note.style.cssText = "margin-top:16px;padding:14px;border-radius:16px;background:rgba(31,76,126,.72);color:#fff;line-height:1.45;font-size:14px;";
+      note.innerHTML = loginInstallNoteHtml();
+      form.insertAdjacentElement("afterend", note);
+    }
+  }
+
+  function setupLoginRequestUi() {
+    const form = $("#loginForm");
+    const userInput = $("#loginUser");
+    const pinInput = $("#loginPin");
+    if (!form || !userInput || !pinInput) return;
+
+    if (!$("#accessRequestLoginStyle")) {
+      const style = document.createElement("style");
+      style.id = "accessRequestLoginStyle";
+      style.textContent = `
+        #loginAccessHelp { margin-top:12px;padding:12px;border-radius:14px;background:#fff7ed;color:#7c2d12;font-size:13px;line-height:1.35;border:1px solid #fed7aa; }
+        .access-request-note button, #btnInstallLogin { cursor:pointer; }
+        .admin-pin-hidden { display:none !important; }
+      `;
+      document.head.appendChild(style);
+    }
+
+    userInput.placeholder = "Escribe tu nombre o usuario";
+    const submitButton = form.querySelector('button[type="submit"], button:not([type])');
+    const pinContainer = pinInput.closest(".field, .form-field, .input-group, label, div") || pinInput.parentElement;
+    const pinLabel = form.querySelector('label[for="loginPin"]');
+
+    const refresh = () => {
+      const adminMode = isAdminLoginName(userInput.value);
+      if (pinContainer) pinContainer.classList.toggle("admin-pin-hidden", !adminMode);
+      if (pinLabel && pinLabel !== pinContainer) pinLabel.classList.toggle("admin-pin-hidden", !adminMode);
+      pinInput.disabled = !adminMode;
+      pinInput.required = adminMode;
+      if (!adminMode) pinInput.value = "";
+      if (submitButton) submitButton.textContent = adminMode ? "Ingresar como administrador" : "Solicitar acceso";
+    };
+
+    userInput.addEventListener("input", refresh);
+    refresh();
+    replaceLoginInitialUsersNote();
+  }
+
+  async function promptInstallApp() {
+    if (!deferredInstallPrompt) {
+      toast("En celular: abre el menú del navegador y usa Instalar aplicación o Agregar a pantalla principal.");
+      return;
+    }
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    $("#btnInstallApp")?.classList.add("hidden");
   }
 
   function formatDeviceStatus(user) {
@@ -1077,6 +1169,7 @@ window.CMMS_SEED_DATA = {
       planAssignments: Array.isArray(remote.planAssignments) ? remote.planAssignments : state.planAssignments,
       records: Array.isArray(remote.records) ? remote.records : state.records,
       users: mergedUsers,
+      accessRequests: Array.isArray(remote.accessRequests) ? remote.accessRequests : state.accessRequests || [],
     };
     saveData();
   }
@@ -1520,6 +1613,74 @@ window.CMMS_SEED_DATA = {
       : `<tr><td colspan="6">No hay usuarios creados.</td></tr>`;
   }
 
+
+  function ensureAccessRequestsPanel() {
+    const usersTable = $("#usersTable");
+    if (!usersTable) return null;
+    let panel = $("#accessRequestsPanel");
+    if (!panel) {
+      panel = document.createElement("section");
+      panel.id = "accessRequestsPanel";
+      panel.className = "card";
+      panel.style.cssText = "margin-top:18px;padding:18px;border-radius:18px;background:#fff;border:1px solid #dbe7f6;box-shadow:0 12px 30px rgba(15,23,42,.08);";
+      const host = usersTable.closest("table") || usersTable;
+      host.insertAdjacentElement("afterend", panel);
+    }
+    return panel;
+  }
+
+  function renderAccessRequests() {
+    const panel = ensureAccessRequestsPanel();
+    if (!panel) return;
+    panel.classList.toggle("hidden", !can("users"));
+    if (!can("users")) return;
+
+    const requests = Array.isArray(state.accessRequests) ? state.accessRequests : [];
+    const pending = requests.filter((item) => item.status === "pending");
+    const latest = requests.slice(0, 20);
+
+    panel.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px;">
+        <div>
+          <h3 style="margin:0 0 4px;">Solicitudes de acceso</h3>
+          <p class="note" style="margin:0;">Aprueba el primer ingreso del usuario. El dispositivo quedará vinculado en D1.</p>
+        </div>
+        <strong>${pending.length} pendiente(s)</strong>
+      </div>
+      ${latest.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Estado</th>
+                <th>Nombre solicitado</th>
+                <th>Equipo</th>
+                <th>Fecha</th>
+                <th>Acción</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${latest.map((req) => `
+                <tr>
+                  <td>${statusBadge(req.status === "approved" ? "APROBADO" : req.status === "denied" ? "NEGADO" : "PENDIENTE", req.status === "approved" ? "green" : req.status === "denied" ? "red" : "amber")}</td>
+                  <td><strong>${escapeHtml(req.requestedName || req.username || "")}</strong><br><small>${escapeHtml(req.username || "")}</small></td>
+                  <td>${escapeHtml(req.deviceLabel || "Equipo sin identificar")}<br><small>${escapeHtml(req.deviceId || "")}</small></td>
+                  <td>${escapeHtml((req.createdAt || "").slice(0, 19).replace("T", " "))}</td>
+                  <td>
+                    ${req.status === "pending" ? `<div class="row-actions">
+                      <button class="mini-btn" data-approve-access-request="${escapeHtml(req.id)}" type="button">Autorizar</button>
+                      <button class="mini-btn danger" data-deny-access-request="${escapeHtml(req.id)}" type="button">Negar</button>
+                    </div>` : `<small>${escapeHtml(req.detail || "Sin acción pendiente")}</small>`}
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<p class="note">No hay solicitudes de acceso registradas.</p>`}
+    `;
+  }
+
   function renderCurrentUser() {
     const badge = $("#currentUserBadge");
     if (!currentUser) {
@@ -1610,6 +1771,7 @@ window.CMMS_SEED_DATA = {
     renderRoutines();
     renderRecords();
     renderUsers();
+    renderAccessRequests();
     renderConfig();
   }
 
@@ -1827,6 +1989,8 @@ window.CMMS_SEED_DATA = {
       const editUser = event.target.closest("[data-edit-user]");
       const deleteUser = event.target.closest("[data-delete-user]");
       const releaseDevice = event.target.closest("[data-release-device]");
+      const approveAccessRequest = event.target.closest("[data-approve-access-request]");
+      const denyAccessRequest = event.target.closest("[data-deny-access-request]");
       const dashboardCard = event.target.closest("[data-dashboard-card]");
 
       if (editEquipment) {
@@ -1957,6 +2121,48 @@ window.CMMS_SEED_DATA = {
         saveData();
         renderAll();
         toast("Usuario eliminado.");
+      }
+
+      if (approveAccessRequest) {
+        if (!requireAction("users")) return;
+        const id = approveAccessRequest.dataset.approveAccessRequest;
+        if (!confirm("¿Autorizar este equipo para el usuario solicitado?")) return;
+        try {
+          const result = await apiRequest(`/access-requests/${encodeURIComponent(id)}/approve`, {
+            method: "POST",
+            body: { role: "consulta" },
+          });
+          apiAvailable = true;
+          if (result.user) {
+            const index = state.users.findIndex((item) => item.id === result.user.id || item.username === result.user.username);
+            if (index >= 0) state.users[index] = { ...state.users[index], ...result.user };
+            else state.users.push(result.user);
+          }
+          if (Array.isArray(result.accessRequests)) state.accessRequests = result.accessRequests;
+          saveData();
+          renderAll();
+          toast("Acceso autorizado. El usuario ya puede ingresar desde ese equipo.");
+        } catch (error) {
+          console.error(error);
+          toast("No se pudo autorizar la solicitud en D1.");
+        }
+      }
+
+      if (denyAccessRequest) {
+        if (!requireAction("users")) return;
+        const id = denyAccessRequest.dataset.denyAccessRequest;
+        if (!confirm("¿Negar esta solicitud de acceso?")) return;
+        try {
+          const result = await apiRequest(`/access-requests/${encodeURIComponent(id)}/deny`, { method: "POST" });
+          apiAvailable = true;
+          if (Array.isArray(result.accessRequests)) state.accessRequests = result.accessRequests;
+          saveData();
+          renderAll();
+          toast("Solicitud negada.");
+        } catch (error) {
+          console.error(error);
+          toast("No se pudo negar la solicitud en D1.");
+        }
       }
 
       if (dashboardCard) {
@@ -2103,49 +2309,80 @@ window.CMMS_SEED_DATA = {
   }
 
   function bindAuth() {
+    setupLoginRequestUi();
+
     $("#loginForm").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const username = $("#loginUser").value.trim().toLowerCase();
+      const typedName = normalizeAccessName($("#loginUser").value);
+      const username = typedName.toLowerCase();
       const pin = $("#loginPin").value.trim();
       const deviceId = getDeviceId();
       const deviceLabel = getDeviceLabel();
 
-      try {
-        const result = await apiRequest("/auth/login", {
-          method: "POST",
-          body: { username, pin, deviceId, deviceLabel },
-        });
-        apiAvailable = true;
-        clearAccessMessage();
-        unlockAfterLogin(result.user);
-      } catch (error) {
-        if (error.status === 401) {
-          toast("Usuario o PIN incorrecto.");
+      if (!typedName) {
+        toast("Escribe tu nombre o usuario para solicitar acceso.");
+        return;
+      }
+
+      if (isAdminLoginName(username)) {
+        if (!pin) {
+          toast("El administrador debe ingresar PIN.");
           return;
         }
+        try {
+          const result = await apiRequest("/auth/login", {
+            method: "POST",
+            body: { username: "admin", pin, deviceId, deviceLabel },
+          });
+          apiAvailable = true;
+          clearAccessMessage();
+          unlockAfterLogin(result.user);
+        } catch (error) {
+          if (error.status === 401) {
+            toast("Usuario o PIN incorrecto.");
+            return;
+          }
+          console.error(error);
+          toast("No se pudo validar el acceso del administrador en D1.");
+        }
+        return;
+      }
+
+      try {
+        const result = await apiRequest("/auth/request-access", {
+          method: "POST",
+          body: { name: typedName, username, deviceId, deviceLabel },
+        });
+        apiAvailable = true;
+        if (Array.isArray(result.accessRequests)) state.accessRequests = result.accessRequests;
+
+        if (result.status === "APPROVED" && result.user) {
+          clearAccessMessage();
+          unlockAfterLogin(result.user);
+          return;
+        }
+
+        showAccessMessage(`
+          <strong>Solicitud enviada.</strong><br>
+          Usuario solicitado: <strong>${escapeHtml(typedName)}</strong><br>
+          El administrador debe autorizar este equipo antes de ingresar.<br>
+          <strong>Equipo:</strong> ${escapeHtml(deviceLabel)}<br>
+          <small>Instala la app en este mismo celular antes de operar. Si cambias de equipo, deberás solicitar autorización nuevamente.</small><br>
+          <button id="btnInstallLogin" class="mini-btn" type="button" style="margin-top:10px;">Instalar app</button>
+        `);
+      } catch (error) {
         if (error.status === 403 && error.payload?.code === "DEVICE_LOCKED") {
           showAccessMessage(`
             <strong>Acceso bloqueado por cambio de equipo.</strong><br>
             Este usuario ya fue autorizado en otro dispositivo.<br>
-            Solicita al administrador liberar el equipo desde el módulo Usuarios.<br>
+            Solicita al administrador liberar o autorizar nuevamente el equipo desde el módulo Usuarios.<br>
             <strong>Usuario:</strong> ${escapeHtml(error.payload.username || username)}<br>
-            <strong>Este equipo:</strong> ${escapeHtml(deviceLabel)}<br>
-            <strong>Código:</strong> ${escapeHtml(deviceId)}
-          `);
+            <strong>Este equipo:</strong> ${escapeHtml(deviceLabel)}
+          `, "Equipo no autorizado. Solicita autorización al administrador.");
           return;
         }
-
-        if (!REQUIRE_D1_LOGIN) {
-          const localUser = findInitialUser(username, pin);
-          if (localUser) {
-            clearAccessMessage();
-            unlockAfterLogin(localUser);
-            return;
-          }
-        }
-
         console.error(error);
-        toast("No se pudo validar el acceso en Cloudflare D1. Revisa el deploy y el binding DB.");
+        toast("No se pudo enviar la solicitud. Revisa D1, el binding DB y el deploy.");
       }
     });
 
@@ -2167,18 +2404,16 @@ window.CMMS_SEED_DATA = {
     window.addEventListener("beforeinstallprompt", (event) => {
       event.preventDefault();
       deferredInstallPrompt = event;
-      $("#btnInstallApp").classList.remove("hidden");
+      $("#btnInstallApp")?.classList.remove("hidden");
+      $("#btnInstallLogin")?.classList.remove("hidden");
     });
 
-    $("#btnInstallApp").addEventListener("click", async () => {
-      if (!deferredInstallPrompt) {
-        toast("Si no ves la instalación automática, usa el menú del navegador: Instalar aplicación.");
-        return;
+    $("#btnInstallApp")?.addEventListener("click", promptInstallApp);
+
+    document.body.addEventListener("click", (event) => {
+      if (event.target.closest("#btnInstallLogin")) {
+        promptInstallApp();
       }
-      deferredInstallPrompt.prompt();
-      await deferredInstallPrompt.userChoice;
-      deferredInstallPrompt = null;
-      $("#btnInstallApp").classList.add("hidden");
     });
   }
 
