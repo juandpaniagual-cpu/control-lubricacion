@@ -668,12 +668,15 @@ window.CMMS_SEED_DATA = {
 (function () {
   const STORAGE_KEY = "cmms_lubricacion_local_v1";
   const API_BASE = "./api";
-  const APP_VERSION = "2026-07-05-loginfix2";
+  const APP_VERSION = "2026-07-06-d1-device-access-v1";
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
   const families = ["Todos", "Centrífugas", "Bombas", "Chillers", "Compresores", "Empaque", "Motores", "General"];
   const SESSION_KEY = "cmms_lubricacion_session_v1";
+  const DEVICE_KEY = "cmms_lubricacion_device_id_v1";
+  const DEVICE_LABEL_KEY = "cmms_lubricacion_device_label_v1";
+  const REQUIRE_D1_LOGIN = true;
   const roleLabels = {
     admin: "Administrador",
     supervisor: "Supervisor",
@@ -983,6 +986,63 @@ window.CMMS_SEED_DATA = {
     if (can(action)) return true;
     toast(message);
     return false;
+  }
+
+
+  function getDeviceId() {
+    let deviceId = localStorage.getItem(DEVICE_KEY);
+    if (!deviceId) {
+      deviceId = uid("DEV");
+      localStorage.setItem(DEVICE_KEY, deviceId);
+    }
+    return deviceId;
+  }
+
+  function getDeviceLabel() {
+    let label = localStorage.getItem(DEVICE_LABEL_KEY);
+    if (!label) {
+      const platform = navigator.platform || "Equipo";
+      const brand = navigator.userAgentData?.brands?.[0]?.brand || "Navegador";
+      label = `${platform} · ${brand} · ${new Date().toLocaleDateString("es-CO")}`;
+      localStorage.setItem(DEVICE_LABEL_KEY, label);
+    }
+    return label;
+  }
+
+  function ensureAccessHelp() {
+    const form = $("#loginForm");
+    if (!form) return null;
+    let help = $("#loginAccessHelp");
+    if (!help) {
+      help = document.createElement("div");
+      help.id = "loginAccessHelp";
+      help.style.cssText = "margin-top:12px;padding:12px;border-radius:14px;background:#fff7ed;color:#7c2d12;font-size:13px;line-height:1.35;border:1px solid #fed7aa;display:none;";
+      form.insertAdjacentElement("afterend", help);
+    }
+    return help;
+  }
+
+  function showAccessMessage(message) {
+    const help = ensureAccessHelp();
+    if (help) {
+      help.innerHTML = message;
+      help.style.display = "block";
+    }
+    toast("Equipo no autorizado. Solicita acceso al administrador.");
+  }
+
+  function clearAccessMessage() {
+    const help = $("#loginAccessHelp");
+    if (help) {
+      help.textContent = "";
+      help.style.display = "none";
+    }
+  }
+
+  function formatDeviceStatus(user) {
+    if (user.role === "admin") return "Equipo: llave maestra";
+    if (user.authorizedDeviceId) return `Equipo autorizado: ${user.authorizedDeviceLabel || user.authorizedDeviceId}`;
+    return "Equipo: pendiente de primer acceso";
   }
 
   async function apiRequest(path, options = {}) {
@@ -1443,10 +1503,14 @@ window.CMMS_SEED_DATA = {
               <td>${escapeHtml(user.username || "")}</td>
               <td>${escapeHtml(roleLabels[user.role] || user.role || "")}</td>
               <td>${user.active === false ? statusBadge("INACTIVO", "gray") : statusBadge("ACTIVO", "green")}</td>
-              <td>${escapeHtml(user.note || "")}</td>
+              <td>
+                ${escapeHtml(user.note || "")}
+                <br><small>${escapeHtml(formatDeviceStatus(user))}</small>
+              </td>
               <td>
                 <div class="row-actions">
                   <button class="mini-btn" data-edit-user="${escapeHtml(user.id)}" type="button">Editar</button>
+                  ${user.role !== "admin" && user.authorizedDeviceId ? `<button class="mini-btn" data-release-device="${escapeHtml(user.id)}" type="button">Liberar equipo</button>` : ""}
                   <button class="mini-btn danger" data-delete-user="${escapeHtml(user.id)}" type="button">Eliminar</button>
                 </div>
               </td>
@@ -1762,6 +1826,7 @@ window.CMMS_SEED_DATA = {
       const deleteRecord = event.target.closest("[data-delete-record]");
       const editUser = event.target.closest("[data-edit-user]");
       const deleteUser = event.target.closest("[data-delete-user]");
+      const releaseDevice = event.target.closest("[data-release-device]");
       const dashboardCard = event.target.closest("[data-dashboard-card]");
 
       if (editEquipment) {
@@ -1847,6 +1912,30 @@ window.CMMS_SEED_DATA = {
         $("#userActive").value = user.active === false ? "false" : "true";
         $("#userNote").value = user.note || "";
         toast("Usuario cargado para edición.");
+      }
+
+      if (releaseDevice) {
+        if (!requireAction("users")) return;
+        const id = releaseDevice.dataset.releaseDevice;
+        const user = state.users.find((item) => item.id === id);
+        if (!user) return;
+        if (!confirm("¿Liberar el equipo autorizado para este usuario? El próximo ingreso vinculará el nuevo dispositivo.")) return;
+        try {
+          const result = await apiRequest(`/users/${encodeURIComponent(id)}/release-device`, { method: "POST" });
+          apiAvailable = true;
+          if (result.user) Object.assign(user, result.user);
+          else {
+            delete user.authorizedDeviceId;
+            delete user.authorizedDeviceLabel;
+            delete user.authorizedDeviceAt;
+          }
+        } catch (error) {
+          toast("No se pudo liberar en D1. Revisa el binding DB y el deploy.");
+          return;
+        }
+        saveData();
+        renderAll();
+        toast("Equipo liberado. El usuario deberá ingresar desde el nuevo dispositivo.");
       }
 
       if (deleteUser) {
@@ -2018,25 +2107,46 @@ window.CMMS_SEED_DATA = {
       event.preventDefault();
       const username = $("#loginUser").value.trim().toLowerCase();
       const pin = $("#loginPin").value.trim();
-      let user = findInitialUser(username, pin);
-      if (!user) {
-        try {
-          const result = await apiRequest("/auth/login", { method: "POST", body: { username, pin } });
-          apiAvailable = true;
-          user = result.user;
-        } catch (error) {
-          if (apiAvailable && error.status === 401) {
-            toast("Usuario o PIN incorrecto.");
+      const deviceId = getDeviceId();
+      const deviceLabel = getDeviceLabel();
+
+      try {
+        const result = await apiRequest("/auth/login", {
+          method: "POST",
+          body: { username, pin, deviceId, deviceLabel },
+        });
+        apiAvailable = true;
+        clearAccessMessage();
+        unlockAfterLogin(result.user);
+      } catch (error) {
+        if (error.status === 401) {
+          toast("Usuario o PIN incorrecto.");
+          return;
+        }
+        if (error.status === 403 && error.payload?.code === "DEVICE_LOCKED") {
+          showAccessMessage(`
+            <strong>Acceso bloqueado por cambio de equipo.</strong><br>
+            Este usuario ya fue autorizado en otro dispositivo.<br>
+            Solicita al administrador liberar el equipo desde el módulo Usuarios.<br>
+            <strong>Usuario:</strong> ${escapeHtml(error.payload.username || username)}<br>
+            <strong>Este equipo:</strong> ${escapeHtml(deviceLabel)}<br>
+            <strong>Código:</strong> ${escapeHtml(deviceId)}
+          `);
+          return;
+        }
+
+        if (!REQUIRE_D1_LOGIN) {
+          const localUser = findInitialUser(username, pin);
+          if (localUser) {
+            clearAccessMessage();
+            unlockAfterLogin(localUser);
             return;
           }
-          user = findInitialUser(username, pin);
         }
+
+        console.error(error);
+        toast("No se pudo validar el acceso en Cloudflare D1. Revisa el deploy y el binding DB.");
       }
-      if (!user) {
-        toast("Usuario o PIN incorrecto.");
-        return;
-      }
-      unlockAfterLogin(user);
     });
 
     $("#btnLogout").addEventListener("click", () => {
