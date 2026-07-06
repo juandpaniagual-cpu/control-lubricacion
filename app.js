@@ -1,4 +1,4 @@
-﻿window.CMMS_SEED_DATA = {
+window.CMMS_SEED_DATA = {
   seedVersion: "excel-lubricacion-2026-07-04-v3-pwa-roles",
   sourceFile: "Formato_seguimiento_lubricacion_centrifugas.xlsx",
   sourceSheet: "PLAN_MAESTRO / REGISTRO_EJECUCIONES / PARAMETROS",
@@ -1754,7 +1754,7 @@
   }
 
   function bindRowActions() {
-    document.body.addEventListener("click", ansyc (event) => {
+    document.body.addEventListener("click", ansync (event) => {
       const editEquipment = event.target.closest("[data-edit-equipment]");
       const deleteEquipment = event.target.closest("[data-delete-equipment]");
       const editRoutine = event.target.closest("[data-edit-routine]");
