@@ -668,7 +668,7 @@ window.CMMS_SEED_DATA = {
 (function () {
   const STORAGE_KEY = "cmms_lubricacion_local_v1";
   const API_BASE = "./api";
-  const APP_VERSION = "2026-07-05-loginfix";
+  const APP_VERSION = "2026-07-05-loginfix2";
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -1754,7 +1754,7 @@ window.CMMS_SEED_DATA = {
   }
 
   function bindRowActions() {
-    document.body.addEventListener("click", ansync (event) => {
+    document.body.addEventListener("click", async (event) => {
       const editEquipment = event.target.closest("[data-edit-equipment]");
       const deleteEquipment = event.target.closest("[data-delete-equipment]");
       const editRoutine = event.target.closest("[data-edit-routine]");
