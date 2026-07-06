@@ -668,7 +668,7 @@ window.CMMS_SEED_DATA = {
 (function () {
   const STORAGE_KEY = "cmms_lubricacion_local_v1";
   const API_BASE = "./api";
-  const APP_VERSION = "2026-07-06-d1-access-request-v2";
+  const APP_VERSION = "2026-07-06-d1-access-request-v3-install-inside";
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -1056,9 +1056,7 @@ window.CMMS_SEED_DATA = {
       El administrador aprobará el ingreso desde la app.<br>
       <strong>Importante:</strong> este acceso queda vinculado a un solo celular o computador.
       Si cambias de equipo, deberás solicitar autorización nuevamente.<br>
-      <button id="btnInstallLogin" class="mini-btn" type="button" style="margin-top:10px;background:#ffffff;color:#1d4ed8;border:1px solid rgba(255,255,255,.7);font-weight:800;">
-        Instalar app en este celular
-      </button>
+      <small>La instalación de la app será opcional después de ingresar.</small>
     `;
   }
 
@@ -1094,21 +1092,35 @@ window.CMMS_SEED_DATA = {
       style.id = "accessRequestLoginStyle";
       style.textContent = `
         #loginAccessHelp { margin-top:12px;padding:12px;border-radius:14px;background:#fff7ed;color:#7c2d12;font-size:13px;line-height:1.35;border:1px solid #fed7aa; }
-        .access-request-note button, #btnInstallLogin { cursor:pointer; }
         .admin-pin-hidden { display:none !important; }
+        .install-app-inline-btn { display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:9px 12px;font-weight:800; }
       `;
       document.head.appendChild(style);
     }
 
     userInput.placeholder = "Escribe tu nombre o usuario";
+    userInput.disabled = false;
+    userInput.required = true;
+    userInput.classList.remove("admin-pin-hidden");
+
     const submitButton = form.querySelector('button[type="submit"], button:not([type])');
-    const pinContainer = pinInput.closest(".field, .form-field, .input-group, label, div") || pinInput.parentElement;
     const pinLabel = form.querySelector('label[for="loginPin"]');
+    const possiblePinContainer = pinInput.closest(".field, .form-field, .input-group, label") || pinInput.parentElement;
+    const canHidePinContainer =
+      possiblePinContainer &&
+      !possiblePinContainer.contains(userInput) &&
+      !possiblePinContainer.querySelector('button[type="submit"], button:not([type])');
+
+    const setHidden = (node, hidden) => {
+      if (!node) return;
+      node.classList.toggle("admin-pin-hidden", hidden);
+    };
 
     const refresh = () => {
       const adminMode = isAdminLoginName(userInput.value);
-      if (pinContainer) pinContainer.classList.toggle("admin-pin-hidden", !adminMode);
-      if (pinLabel && pinLabel !== pinContainer) pinLabel.classList.toggle("admin-pin-hidden", !adminMode);
+      setHidden(pinInput, !adminMode);
+      setHidden(pinLabel, !adminMode);
+      if (canHidePinContainer) setHidden(possiblePinContainer, !adminMode);
       pinInput.disabled = !adminMode;
       pinInput.required = adminMode;
       if (!adminMode) pinInput.value = "";
@@ -1118,6 +1130,38 @@ window.CMMS_SEED_DATA = {
     userInput.addEventListener("input", refresh);
     refresh();
     replaceLoginInitialUsersNote();
+  }
+
+  function isStandaloneMode() {
+    return window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone === true;
+  }
+
+  function ensureInstallButtonInApp() {
+    let btn = $("#btnInstallApp");
+    if (btn) return btn;
+
+    btn = document.createElement("button");
+    btn.id = "btnInstallApp";
+    btn.type = "button";
+    btn.className = "mini-btn install-app-inline-btn hidden";
+    btn.title = "Instalar aplicación";
+    btn.innerHTML = "📲 Instalar app";
+
+    const logout = $("#btnLogout");
+    if (logout?.parentElement) {
+      logout.parentElement.insertBefore(btn, logout);
+      return btn;
+    }
+
+    const target = document.querySelector("header .actions, .header-actions, .top-actions, header, .app-header") || document.body;
+    target.appendChild(btn);
+    return btn;
+  }
+
+  function refreshInstallButtonVisibility() {
+    const btn = ensureInstallButtonInApp();
+    const shouldShow = !!currentUser && !isStandaloneMode();
+    btn.classList.toggle("hidden", !shouldShow);
   }
 
   async function promptInstallApp() {
@@ -1226,6 +1270,7 @@ window.CMMS_SEED_DATA = {
       renderCurrentUser();
       applyPermissions();
     }
+    refreshInstallButtonVisibility();
     toast(`Bienvenido, ${user.name}.`);
   }
 
@@ -1693,7 +1738,11 @@ window.CMMS_SEED_DATA = {
   function applyPermissions() {
     document.body.classList.toggle("locked", !currentUser);
     $("#loginScreen").classList.toggle("hidden", !!currentUser);
-    if (!currentUser) return;
+    if (!currentUser) {
+      $("#btnInstallApp")?.classList.add("hidden");
+      return;
+    }
+    refreshInstallButtonVisibility();
 
     $$(".nav-btn").forEach((btn) => {
       btn.classList.toggle("hidden", !canView(btn.dataset.view));
@@ -2367,8 +2416,7 @@ window.CMMS_SEED_DATA = {
           Usuario solicitado: <strong>${escapeHtml(typedName)}</strong><br>
           El administrador debe autorizar este equipo antes de ingresar.<br>
           <strong>Equipo:</strong> ${escapeHtml(deviceLabel)}<br>
-          <small>Instala la app en este mismo celular antes de operar. Si cambias de equipo, deberás solicitar autorización nuevamente.</small><br>
-          <button id="btnInstallLogin" class="mini-btn" type="button" style="margin-top:10px;">Instalar app</button>
+          <small>Cuando el administrador apruebe, podrás ingresar. La instalación será opcional dentro de la app.</small>
         `);
       } catch (error) {
         if (error.status === 403 && error.payload?.code === "DEVICE_LOCKED") {
@@ -2401,19 +2449,20 @@ window.CMMS_SEED_DATA = {
       });
     }
 
+    const installButton = ensureInstallButtonInApp();
+    installButton.addEventListener("click", promptInstallApp);
+    refreshInstallButtonVisibility();
+
     window.addEventListener("beforeinstallprompt", (event) => {
       event.preventDefault();
       deferredInstallPrompt = event;
-      $("#btnInstallApp")?.classList.remove("hidden");
-      $("#btnInstallLogin")?.classList.remove("hidden");
+      refreshInstallButtonVisibility();
     });
 
-    $("#btnInstallApp")?.addEventListener("click", promptInstallApp);
-
-    document.body.addEventListener("click", (event) => {
-      if (event.target.closest("#btnInstallLogin")) {
-        promptInstallApp();
-      }
+    window.addEventListener("appinstalled", () => {
+      deferredInstallPrompt = null;
+      $("#btnInstallApp")?.classList.add("hidden");
+      toast("App instalada correctamente.");
     });
   }
 
