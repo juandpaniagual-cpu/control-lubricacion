@@ -7,8 +7,8 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
 }
 
-function error(message, status = 400) {
-  return json({ ok: false, error: message }, status);
+function error(message, status = 400, extra = {}) {
+  return json({ ok: false, error: message, ...extra }, status);
 }
 
 async function bodyJson(request) {
@@ -41,6 +41,28 @@ async function run(db, sql, params = []) {
   return await db.prepare(sql).bind(...params).run();
 }
 
+async function logDeviceEvent(db, data) {
+  try {
+    await run(
+      db,
+      `INSERT INTO device_access_events (id, user_id, username, device_id, device_label, event_type, detail, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        makeId("DVE"),
+        data.userId || "",
+        data.username || "",
+        data.deviceId || "",
+        data.deviceLabel || "",
+        data.eventType || "INFO",
+        data.detail || "",
+        new Date().toISOString(),
+      ]
+    );
+  } catch (err) {
+    console.warn("No se pudo registrar evento de dispositivo", err);
+  }
+}
+
 function user(row) {
   return {
     id: row.id,
@@ -49,6 +71,10 @@ function user(row) {
     role: row.role,
     note: row.note || "",
     active: row.active === 1 || row.active === true,
+    authorizedDeviceId: row.authorized_device_id || "",
+    authorizedDeviceLabel: row.authorized_device_label || "",
+    authorizedDeviceAt: row.authorized_device_at || "",
+    lastLoginAt: row.last_login_at || "",
   };
 }
 
@@ -137,7 +163,13 @@ async function bootstrap(db) {
   const routineRows = await all(db, "SELECT * FROM routines ORDER BY code");
   const planRows = await all(db, "SELECT * FROM plan_assignments ORDER BY id");
   const recordRows = await all(db, "SELECT * FROM execution_records ORDER BY date DESC, created_at DESC");
-  const userRows = await all(db, "SELECT id, name, username, role, note, active FROM users ORDER BY name");
+  const userRows = await all(
+    db,
+    `SELECT id, name, username, role, note, active,
+            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+       FROM users
+      ORDER BY name`
+  );
 
   return {
     ok: true,
@@ -146,7 +178,7 @@ async function bootstrap(db) {
       prealertDays: Number(cfg.prealertDays || 7),
       site: cfg.site || "Planta Sales",
       masterSystem: cfg.masterSystem || "SAP",
-      supportSystem: cfg.supportSystem || "App local / CMMS de turno",
+      supportSystem: cfg.supportSystem || "Cloudflare D1",
     },
     equipment: equipmentRows.map(equipment),
     routines: routineRows.map(routine),
@@ -159,17 +191,41 @@ async function bootstrap(db) {
 async function saveRecord(db, data) {
   const id = data.id || makeId("REG");
   const createdAt = data.createdAt || new Date().toISOString();
-  await run(db, `INSERT OR REPLACE INTO execution_records (
-    id, equipment_id, equipment_code, routine_id, routine_code, date, time, shift, technician,
-    status, hourmeter, lubricant, quantity, loto, oil_condition, sap_notice, sap_order,
-    evidence, supervisor, findings, action, close_date, observations, created_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-    id, data.equipmentId || "", data.equipmentCode || "", data.routineId || "", data.routineCode || "",
-    data.date || "", data.time || "", data.shift || "", data.technician || "", data.status || "",
-    data.hourmeter || "", data.lubricant || "", data.quantity || "", data.loto || "", data.oilCondition || "",
-    data.sapNotice || "", data.sapOrder || "", data.evidence || "", data.supervisor || "", data.findings || "",
-    data.action || "", data.closeDate || "", data.observations || "", createdAt
-  ]);
+  await run(
+    db,
+    `INSERT OR REPLACE INTO execution_records (
+      id, equipment_id, equipment_code, routine_id, routine_code, date, time, shift,
+      technician, status, hourmeter, lubricant, quantity, loto, oil_condition,
+      sap_notice, sap_order, evidence, supervisor, findings, action, close_date,
+      observations, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      data.equipmentId || "",
+      data.equipmentCode || "",
+      data.routineId || "",
+      data.routineCode || "",
+      data.date || "",
+      data.time || "",
+      data.shift || "",
+      data.technician || "",
+      data.status || "",
+      data.hourmeter || "",
+      data.lubricant || "",
+      data.quantity || "",
+      data.loto || "",
+      data.oilCondition || "",
+      data.sapNotice || "",
+      data.sapOrder || "",
+      data.evidence || "",
+      data.supervisor || "",
+      data.findings || "",
+      data.action || "",
+      data.closeDate || "",
+      data.observations || "",
+      createdAt,
+    ]
+  );
   return { ...data, id, createdAt };
 }
 
@@ -177,13 +233,146 @@ async function saveUser(db, data) {
   const id = data.id || makeId("USR");
   const username = String(data.username || "").trim().toLowerCase();
   if (!username || !data.name || !data.pin) throw new Error("Nombre, usuario y PIN son requeridos");
-  await run(db, `INSERT OR REPLACE INTO users
-    (id, name, username, pin, role, note, active, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
-      id, data.name || "", username, data.pin || "", data.role || "tecnico",
-      data.note || "", data.active === false ? 0 : 1, new Date().toISOString()
-    ]);
-  return user({ ...data, id, username, active: data.active === false ? 0 : 1 });
+
+  const existing = await first(db, "SELECT * FROM users WHERE id = ? OR lower(username) = ?", [id, username]);
+  const authorizedDeviceId = data.authorizedDeviceId ?? existing?.authorized_device_id ?? "";
+  const authorizedDeviceLabel = data.authorizedDeviceLabel ?? existing?.authorized_device_label ?? "";
+  const authorizedDeviceAt = data.authorizedDeviceAt ?? existing?.authorized_device_at ?? "";
+  const lastLoginAt = existing?.last_login_at || "";
+
+  await run(
+    db,
+    `INSERT OR REPLACE INTO users (
+      id, name, username, pin, role, note, active,
+      authorized_device_id, authorized_device_label, authorized_device_at, last_login_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      data.name || "",
+      username,
+      data.pin || "",
+      data.role || "tecnico",
+      data.note || "",
+      data.active === false ? 0 : 1,
+      authorizedDeviceId,
+      authorizedDeviceLabel,
+      authorizedDeviceAt,
+      lastLoginAt,
+      new Date().toISOString(),
+    ]
+  );
+
+  const row = await first(
+    db,
+    `SELECT id, name, username, role, note, active,
+            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+       FROM users WHERE id = ?`,
+    [id]
+  );
+  return user(row);
+}
+
+async function login(db, data) {
+  const username = String(data.username || "").trim().toLowerCase();
+  const pin = String(data.pin || "").trim();
+  const deviceId = String(data.deviceId || "").trim();
+  const deviceLabel = String(data.deviceLabel || "Equipo sin identificar").slice(0, 180);
+
+  const row = await first(db, "SELECT * FROM users WHERE lower(username) = ? AND pin = ? AND active = 1", [username, pin]);
+  if (!row) return { response: error("Usuario o PIN incorrecto", 401) };
+
+  const now = new Date().toISOString();
+
+  if (row.role !== "admin") {
+    if (!deviceId) {
+      return { response: error("No se pudo identificar este equipo", 400, { code: "DEVICE_REQUIRED" }) };
+    }
+
+    if (!row.authorized_device_id) {
+      await run(
+        db,
+        `UPDATE users
+            SET authorized_device_id = ?, authorized_device_label = ?, authorized_device_at = ?, last_login_at = ?, updated_at = ?
+          WHERE id = ?`,
+        [deviceId, deviceLabel, now, now, now, row.id]
+      );
+      await logDeviceEvent(db, {
+        userId: row.id,
+        username: row.username,
+        deviceId,
+        deviceLabel,
+        eventType: "AUTHORIZED_FIRST_DEVICE",
+        detail: "Primer ingreso: dispositivo vinculado automáticamente.",
+      });
+    } else if (row.authorized_device_id !== deviceId) {
+      await logDeviceEvent(db, {
+        userId: row.id,
+        username: row.username,
+        deviceId,
+        deviceLabel,
+        eventType: "DENIED_DIFFERENT_DEVICE",
+        detail: `Intento desde equipo diferente. Equipo autorizado: ${row.authorized_device_label || row.authorized_device_id}`,
+      });
+      return {
+        response: error("Usuario autorizado en otro equipo", 403, {
+          code: "DEVICE_LOCKED",
+          username: row.username,
+          authorizedDeviceLabel: row.authorized_device_label || "Equipo autorizado previamente",
+          authorizedDeviceAt: row.authorized_device_at || "",
+        }),
+      };
+    } else {
+      await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
+      await logDeviceEvent(db, {
+        userId: row.id,
+        username: row.username,
+        deviceId,
+        deviceLabel,
+        eventType: "LOGIN_OK",
+        detail: "Ingreso desde equipo autorizado.",
+      });
+    }
+  } else {
+    await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
+  }
+
+  const updated = await first(
+    db,
+    `SELECT id, name, username, role, note, active,
+            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+       FROM users WHERE id = ?`,
+    [row.id]
+  );
+  return { user: user(updated) };
+}
+
+async function releaseDevice(db, id) {
+  const row = await first(db, "SELECT * FROM users WHERE id = ?", [id]);
+  if (!row) throw new Error("Usuario no encontrado");
+  const now = new Date().toISOString();
+  await run(
+    db,
+    `UPDATE users
+        SET authorized_device_id = '', authorized_device_label = '', authorized_device_at = '', updated_at = ?
+      WHERE id = ?`,
+    [now, id]
+  );
+  await logDeviceEvent(db, {
+    userId: row.id,
+    username: row.username,
+    deviceId: row.authorized_device_id || "",
+    deviceLabel: row.authorized_device_label || "",
+    eventType: "RELEASED_BY_ADMIN",
+    detail: "Equipo liberado desde el módulo Usuarios.",
+  });
+  const updated = await first(
+    db,
+    `SELECT id, name, username, role, note, active,
+            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+       FROM users WHERE id = ?`,
+    [id]
+  );
+  return user(updated);
 }
 
 export async function onRequest({ request, env }) {
@@ -200,12 +389,9 @@ export async function onRequest({ request, env }) {
     if (method === "GET" && path === "/api/bootstrap") return json(await bootstrap(db));
 
     if (method === "POST" && path === "/api/auth/login") {
-      const data = await bodyJson(request);
-      const username = String(data.username || "").trim().toLowerCase();
-      const pin = String(data.pin || "").trim();
-      const row = await first(db, "SELECT id, name, username, role, note, active FROM users WHERE lower(username) = ? AND pin = ? AND active = 1", [username, pin]);
-      if (!row) return error("Usuario o PIN incorrecto", 401);
-      return json({ ok: true, user: user(row) });
+      const result = await login(db, await bodyJson(request));
+      if (result.response) return result.response;
+      return json({ ok: true, user: result.user });
     }
 
     if (method === "GET" && path === "/api/equipment") {
@@ -235,11 +421,25 @@ export async function onRequest({ request, env }) {
     }
 
     if (method === "GET" && path === "/api/users") {
-      return json({ ok: true, users: (await all(db, "SELECT id, name, username, role, note, active FROM users ORDER BY name")).map(user) });
+      return json({
+        ok: true,
+        users: (await all(
+          db,
+          `SELECT id, name, username, role, note, active,
+                  authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
+             FROM users
+            ORDER BY name`
+        )).map(user),
+      });
     }
 
     if (method === "POST" && path === "/api/users") {
       return json({ ok: true, user: await saveUser(db, await bodyJson(request)) }, 201);
+    }
+
+    if (method === "POST" && path.startsWith("/api/users/") && path.endsWith("/release-device")) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      return json({ ok: true, user: await releaseDevice(db, id) });
     }
 
     if (method === "DELETE" && path.startsWith("/api/users/")) {
