@@ -668,7 +668,7 @@ window.CMMS_SEED_DATA = {
 (function () {
   const STORAGE_KEY = "cmms_lubricacion_local_v1";
   const API_BASE = "./api";
-  const APP_VERSION = "2026-07-06-d1-access-request-v4-login-note-layout";
+  const APP_VERSION = "2026-07-06-d1-dashboard-navigation-v6";
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -1755,6 +1755,53 @@ window.CMMS_SEED_DATA = {
     badge.textContent = `${currentUser.name} · ${roleLabels[currentUser.role] || currentUser.role}`;
   }
 
+  function ensureEngineerSignature() {
+    let signature = $("#engineerSignature");
+    if (!signature) {
+      signature = document.createElement("div");
+      signature.id = "engineerSignature";
+      signature.className = "engineer-signature";
+      signature.textContent = "    ";
+      document.body.appendChild(signature);
+    }
+
+    if (!$("#engineerSignatureStyle")) {
+      const style = document.createElement("style");
+      style.id = "engineerSignatureStyle";
+      style.textContent = `
+        .engineer-signature {
+          position: fixed;
+          right: 14px;
+          bottom: 10px;
+          z-index: 9999;
+          max-width: min(92vw, 520px);
+          padding: 7px 11px;
+          border-radius: 999px;
+          background: rgba(15, 23, 42, 0.72);
+          color: rgba(255, 255, 255, 0.92);
+          font-size: 11.5px;
+          line-height: 1.25;
+          letter-spacing: 0.01em;
+          box-shadow: 0 8px 22px rgba(15, 23, 42, 0.18);
+          backdrop-filter: blur(8px);
+          pointer-events: none;
+        }
+        @media (max-width: 640px) {
+          .engineer-signature {
+            left: 10px;
+            right: 10px;
+            bottom: 8px;
+            text-align: center;
+            font-size: 10.8px;
+            padding: 6px 10px;
+          }
+        }
+      `;
+      document.head.appendChild(style);
+    }
+  }
+
+
   function applyPermissions() {
     document.body.classList.toggle("locked", !currentUser);
     $("#loginScreen").classList.toggle("hidden", !!currentUser);
@@ -1830,6 +1877,7 @@ window.CMMS_SEED_DATA = {
   }
 
   function renderAll() {
+    ensureEngineerSignature();
     renderCurrentUser();
     applyPermissions();
     populateExecutionSelectors();
@@ -2235,8 +2283,29 @@ window.CMMS_SEED_DATA = {
       }
 
       if (dashboardCard) {
-        dashboardFilters.status = dashboardCard.dataset.dashboardCard || "";
-        renderAll();
+        const selectedStatus = dashboardCard.dataset.dashboardCard || "";
+        dashboardFilters.status = selectedStatus;
+
+        if (selectedStatus) {
+          const planFilter = $("#planStatusFilter");
+          if (planFilter) {
+            planFilter.value = selectedStatus;
+          }
+          renderAll();
+          showView("plan");
+          setTimeout(() => {
+            $("#plan")?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }, 60);
+          const label = selectedStatus === "PROXIMO" ? "PRÓXIMAS" : selectedStatus;
+          toast(`Filtro aplicado en Plan maestro: ${label}.`);
+        } else {
+          renderAll();
+          showView("historico");
+          setTimeout(() => {
+            $("#historico")?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }, 60);
+          toast("Abriendo histórico de ejecuciones.");
+        }
       }
     });
   }
@@ -2548,6 +2617,7 @@ window.CMMS_SEED_DATA = {
 
   function init() {
     window.CMMS_APP_VERSION = APP_VERSION;
+    ensureEngineerSignature();
     document.body.classList.add("locked");
     currentUser = loadSessionUser();
     bindNavigation();
