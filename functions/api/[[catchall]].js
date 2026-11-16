@@ -1,697 +1,222 @@
-const JSON_HEADERS = {
-  "Content-Type": "application/json; charset=utf-8",
-  "Cache-Control": "no-store",
-};
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
+import {failureModes,diagnosticStates} from '../../vibration.js';
+import {validateThermal,thermalSummary} from '../../thermal.js';
+import {readLegacy,saveLegacy} from '../../lib/legacy-storage.js';
+import {authenticateLegacy,approveRequest} from '../../lib/legacy-auth.js';
+import {actions as lubricationActions,emptyState,cleanState,authorizeChanges} from '../../lib/lubrication.js';
+const modules = ['lubricacion','medicion'];
+const kinds = ['medicion'];
+const techniques = ['Vibraciones','Termografía','Ultrasonido','Espesores','Análisis de aceite'];
+const now = () => new Date().toISOString();
+const id = () => crypto.randomUUID();
+const fail = (message,status=400) => { throw Object.assign(new Error(message),{status}); };
+const json = (data,status=200,headers={}) => new Response(JSON.stringify(data), {status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
+const stmt = (db,sql,args=[]) => db.prepare(sql).bind(...args);
+const first = (db,sql,args=[]) => stmt(db,sql,args).first();
+const rows = async(db,sql,args=[]) => (await stmt(db,sql,args).all()).results || [];
+async function equipmentCatalog(db,plant){
+ if(plant==='HIPOCALCIO')return (await readLegacy(db)).state.equipment;
+ const saved=await first(db,'SELECT data FROM mp_lubrication WHERE plant_id=?',[plant]);
+ return saved?(JSON.parse(saved.data).equipment||[]):[];
 }
-
-function error(message, status = 400, extra = {}) {
-  return json({ ok: false, error: message, ...extra }, status);
+const encode = value => new TextEncoder().encode(value);
+const hex = buffer => Array.from(new Uint8Array(buffer),v=>v.toString(16).padStart(2,'0')).join('');
+const digest = async text => hex(await crypto.subtle.digest('SHA-256',encode(text)));
+async function hash(password,salt) {
+ const key=await crypto.subtle.importKey('raw',encode(password),'PBKDF2',false,['deriveBits']);
+ return hex(await crypto.subtle.deriveBits({name:'PBKDF2',salt:encode(salt),iterations:100000,hash:'SHA-256'},key,256));
 }
-
-async function bodyJson(request) {
-  try {
-    return await request.json();
-  } catch {
-    return {};
+function equal(a,b){if(a.length!==b.length)return false;let n=0;for(let i=0;i<a.length;i++)n|=a.charCodeAt(i)^b.charCodeAt(i);return n===0;}
+async function body(request){if(!request.headers.get('content-type')?.includes('application/json'))fail('Se requiere JSON',415);const text=await request.text();if(text.length>2000000)fail('Solicitud demasiado grande (máximo 2 MB)',413);try{return JSON.parse(text);}catch{fail('JSON inválido');}}
+function str(value,name,max=300,required=false){if(typeof value!=='string'||value.length>max||(required&&!value.trim()))fail(`Campo inválido: ${name}`);return value.trim();}
+function date(value,name,required=false){if(!value&&!required)return '';str(value,name,10,true);if(!/^\d{4}-\d{2}-\d{2}$/.test(value)||!Number.isFinite(Date.parse(value))||new Date(value).toISOString().slice(0,10)!==value)fail(`Fecha inválida: ${name}`);return value;}
+const publicUser = u => ({id:u.id,name:u.name,username:u.username,role:u.role,active:!!u.active,authorizedDeviceLabel:u.authorized_device_label||'',authorizedDeviceAt:u.authorized_device_at||''});
+function cookie(token,age=28800){return `mp_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${age}`;}
+async function identity(request,db){const token=request.headers.get('cookie')?.match(/(?:^|;\s*)mp_session=([a-f0-9]{64})(?:;|$)/)?.[1];if(!token)fail('Inicia sesión',401);const user=await first(db,'SELECT u.* FROM mp_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1 AND (u.role=\'admin\' OR (s.device_id=u.authorized_device_id AND s.device_id!=\'\'))',[await digest(token),Date.now()]);if(!user)fail('Sesión vencida o desactivada',401);return user;}
+const admin = u => {if(u.role!=='admin')fail('Solo el administrador puede gestionar usuarios, plantas y permisos',403);};
+async function access(db,user,plant,module,write=false){if(!modules.includes(module))fail('Módulo inválido');if(!await first(db,'SELECT id FROM mp_plants WHERE id=?',[plant]))fail('Planta no disponible',404);if(user.role==='admin')return 'edicion';const grant=await first(db,'SELECT permission FROM mp_access WHERE user_id=? AND plant_id=? AND module=?',[user.id,plant,module]);if(!grant||(write&&grant.permission!=='edicion'))fail('Sin acceso a esta planta o módulo',403);return grant.permission;}
+function audit(db,user,action,plant,target){return stmt(db,'INSERT INTO mp_audit(id,actor_id,action,plant_id,target_id,created_at) VALUES (?,?,?,?,?,?)',[id(),user.id,action,plant||null,target||null,now()]);}
+function validate(kind,input){
+ if(!input||typeof input!=='object'||Array.isArray(input))fail('Registro inválido');
+ const data={}; const fields=['equipment','name','area','point','responsible','lubricant','quantity','procedure','sap','technician','findings','action','reference','instrument','conditions','evidence','diagnosis','status','priority','condition','technique','planId'];
+ if(input.thermalPoints!==undefined){if(input.technique!=='Termografía')fail('Los puntos térmicos solo se admiten en Termografía');data.thermalPoints=validateThermal(input.thermalPoints);}
+ if(input.technique==='Vibraciones'){
+  data.failureMode=input.failureMode||'No determinado';data.diagnosticState=input.diagnosticState||'Por evaluar';
+  if(!failureModes.includes(data.failureMode)||!diagnosticStates.includes(data.diagnosticState))fail('Modo de falla o estado inválido');
+  data.failureDetail=str(input.failureDetail||'','detalle de falla',4000,data.failureMode==='Otro');
+  if(data.failureMode==='No determinado'&&data.diagnosticState==='Confirmado por analista')fail('Una falla no determinada no puede marcarse como confirmada');
+ }
+ if(input.oilMethod!==undefined){
+  if(input.technique!=='Análisis de aceite'||!['Laboratorio','TMEH1'].includes(input.oilMethod))fail('Método de aceite inválido');
+  data.oilMethod=input.oilMethod;
+  if(input.oilMethod==='TMEH1'){
+   for(const f of ['oilBrand','oilProduct','oilGrade','oilReference','oilSeries','instrumentSerial'])data[f]=str(input[f],f,250,true);
+   data.referenceDate=date(input.referenceDate,'referencia',true);if(data.referenceDate>input.date)fail('La referencia no puede ser posterior a la muestra');
+   for(const f of ['oilReading','sampleTemperature','equipmentHours','oilHours']){
+    const v=input[f];if((v===undefined||v==='')&&['equipmentHours','oilHours'].includes(f)){data[f]='';continue;}
+    if(typeof v!=='string'||!v.trim()||!Number.isFinite(Number(v)))fail('Valor numérico inválido: '+f);
+    const n=Number(v);if(f==='oilReading'&&(!Number.isInteger(n)||n< -999||n>999))fail('Lectura TMEH 1 fuera de rango (-999 a 999)');
+    if(f==='sampleTemperature'&&(n< -273.15||n>40))fail('La muestra debe estar a no más de 40 °C; acondicione y repita la medición');
+    if(f.endsWith('Hours')&&n<0)fail('Las horas no pueden ser negativas');data[f]=String(n);
+   }
+   if(!['Verde','Roja','No determinada'].includes(input.oilVisual))fail('Indicación visual inválida');data.oilVisual=input.oilVisual;
+   if(!['Ninguna','Cambio de aceite','Reposición','Filtración','Cambio de referencia'].includes(input.oilIntervention))fail('Intervención inválida');data.oilIntervention=input.oilIntervention;
   }
-}
-
-function makeId(prefix) {
-  return `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`.toUpperCase();
-}
-
-function requireDb(env) {
-  if (!env.DB) throw new Error("Falta binding D1 llamado DB");
-  return env.DB;
-}
-
-async function all(db, sql, params = []) {
-  const res = await db.prepare(sql).bind(...params).all();
-  return res.results || [];
-}
-
-async function first(db, sql, params = []) {
-  return await db.prepare(sql).bind(...params).first();
-}
-
-async function run(db, sql, params = []) {
-  return await db.prepare(sql).bind(...params).run();
-}
-
-
-async function ensureAccessRequestsSchema(db) {
-  await run(
-    db,
-    `CREATE TABLE IF NOT EXISTS access_requests (
-      id TEXT PRIMARY KEY,
-      requested_name TEXT NOT NULL,
-      username TEXT NOT NULL,
-      device_id TEXT NOT NULL,
-      device_label TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'pending',
-      user_id TEXT DEFAULT '',
-      role TEXT DEFAULT 'consulta',
-      detail TEXT DEFAULT '',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`
-  );
-  await run(db, "CREATE INDEX IF NOT EXISTS idx_access_requests_status ON access_requests (status, created_at)");
-  await run(db, "CREATE INDEX IF NOT EXISTS idx_access_requests_device ON access_requests (device_id, created_at)");
-  await run(db, "CREATE INDEX IF NOT EXISTS idx_access_requests_username ON access_requests (username, created_at)");
-}
-
-function normalizeUsername(value) {
-  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function accessRequest(row) {
-  return {
-    id: row.id,
-    requestedName: row.requested_name || "",
-    username: row.username || "",
-    deviceId: row.device_id || "",
-    deviceLabel: row.device_label || "",
-    status: row.status || "pending",
-    userId: row.user_id || "",
-    role: row.role || "consulta",
-    detail: row.detail || "",
-    createdAt: row.created_at || "",
-    updatedAt: row.updated_at || "",
-  };
-}
-
-async function listAccessRequests(db) {
-  await ensureAccessRequestsSchema(db);
-  return (await all(db, "SELECT * FROM access_requests ORDER BY created_at DESC LIMIT 100")).map(accessRequest);
-}
-
-async function logDeviceEvent(db, data) {
-  try {
-    await run(
-      db,
-      `INSERT INTO device_access_events (id, user_id, username, device_id, device_label, event_type, detail, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        makeId("DVE"),
-        data.userId || "",
-        data.username || "",
-        data.deviceId || "",
-        data.deviceLabel || "",
-        data.eventType || "INFO",
-        data.detail || "",
-        new Date().toISOString(),
-      ]
-    );
-  } catch (err) {
-    console.warn("No se pudo registrar evento de dispositivo", err);
+ }
+ for(const field of fields)if(input[field]!==undefined)data[field]=str(input[field],field,field==='findings'||field==='diagnosis'||field==='action'||field==='reference'?4000:500);
+ str(data.equipment,'equipo',150,true);
+ if(data.evidence&&!/^https:\/\//i.test(data.evidence))fail('El enlace del informe debe comenzar por https://');
+ if(kind==='plan'){
+  str(data.name,'rutina',300,true); data.frequency=Number(input.frequency);if(!Number.isInteger(data.frequency)||data.frequency<1||data.frequency>3650)fail('Frecuencia: entre 1 y 3650');
+  data.unit=input.unit;if(!['dias','meses'].includes(data.unit))fail('Unidad de frecuencia inválida');data.baseDate=date(input.baseDate,'fecha base',true);
+ }else{
+  data.date=date(input.date,'fecha del análisis / ejecución',true);
+  if(kind==='ejecucion')str(data.planId,'rutina del plan',100,true);
+  if(kind==='medicion'){
+   if(!techniques.includes(data.technique))fail('Técnica inválida');str(data.point,'punto o muestra',300,true);str(data.diagnosis,'diagnóstico',4000,true);
+   if(!['Pendiente','Normal','Observación','Alarma','Crítica'].includes(data.condition))fail('Condición inválida');
+   if(!['Abierto','En seguimiento','Cerrado'].includes(data.status))fail('Estado inválido');
+   data.nextDate=date(input.nextDate,'próximo análisis');if(data.nextDate&&data.nextDate<data.date)fail('La próxima fecha debe ser posterior al análisis');
+   if(data.thermalPoints)data.measurements=thermalSummary(data.thermalPoints);
+   else {if(!Array.isArray(input.measurements)||input.measurements.length>24)fail('Mediciones inválidas');
+   data.measurements=input.measurements.map(m=>({name:str(m.name,'medición',120,true),value:str(m.value,'resultado',300),unit:str(m.unit,'unidad',60)}));}
   }
+ }
+ return data;
 }
-
-function user(row) {
-  return {
-    id: row.id,
-    name: row.name,
-    username: row.username,
-    role: row.role,
-    note: row.note || "",
-    active: row.active === 1 || row.active === true,
-    authorizedDeviceId: row.authorized_device_id || "",
-    authorizedDeviceLabel: row.authorized_device_label || "",
-    authorizedDeviceAt: row.authorized_device_at || "",
-    lastLoginAt: row.last_login_at || "",
-  };
-}
-
-function equipment(row) {
-  return {
-    id: row.id,
-    code: row.code,
-    name: row.name,
-    area: row.area || "",
-    system: row.system || "",
-    subsystem: row.subsystem || "",
-    family: row.family || "General",
-    criticality: row.criticality || "Media",
-    costCenter: row.cost_center || "",
-    active: row.active === 1 || row.active === true,
-  };
-}
-
-function routine(row) {
-  return {
-    id: row.id,
-    code: row.code,
-    name: row.name,
-    scope: row.scope || "Todos",
-    description: row.description || "",
-    frequencyDays: row.frequency_days,
-    frequencyText: row.frequency_text || `${row.frequency_days} días`,
-    responsible: row.responsible || "",
-    lubricant: row.lubricant || "",
-    requiresLoto: row.requires_loto || "Según condición",
-    procedure: row.procedure || "",
-    active: row.active === 1 || row.active === true,
-  };
-}
-
-function assignment(row) {
-  return {
-    id: row.id,
-    equipmentId: row.equipment_id,
-    routineId: row.routine_id,
-    baseDate: row.base_date,
-    responsible: row.responsible || "",
-    procedure: row.procedure || "",
-    lubricant: row.lubricant || "",
-    standardQuantity: row.standard_quantity || "",
-    requiresLoto: row.requires_loto || "",
-    plannedSapOrder: row.planned_sap_order || "",
-    observations: row.observations || "",
-    active: row.active === 1 || row.active === true,
-  };
-}
-
-function record(row) {
-  return {
-    id: row.id,
-    equipmentId: row.equipment_id,
-    equipmentCode: row.equipment_code || "",
-    routineId: row.routine_id,
-    routineCode: row.routine_code || "",
-    date: row.date,
-    time: row.time || "",
-    shift: row.shift || "",
-    technician: row.technician || "",
-    status: row.status || "",
-    hourmeter: row.hourmeter || "",
-    lubricant: row.lubricant || "",
-    quantity: row.quantity || "",
-    loto: row.loto || "",
-    oilCondition: row.oil_condition || "",
-    sapNotice: row.sap_notice || "",
-    sapOrder: row.sap_order || "",
-    evidence: row.evidence || "",
-    supervisor: row.supervisor || "",
-    findings: row.findings || "",
-    action: row.action || "",
-    closeDate: row.close_date || "",
-    observations: row.observations || "",
-    createdAt: row.created_at || "",
-  };
-}
-
-async function bootstrap(db) {
-  await ensureAccessRequestsSchema(db);
-  const settings = await all(db, "SELECT key, value FROM app_settings");
-  const cfg = Object.fromEntries(settings.map((r) => [r.key, r.value]));
-  const equipmentRows = await all(db, "SELECT * FROM equipment ORDER BY code");
-  const routineRows = await all(db, "SELECT * FROM routines ORDER BY code");
-  const planRows = await all(db, "SELECT * FROM plan_assignments ORDER BY id");
-  const recordRows = await all(db, "SELECT * FROM execution_records ORDER BY date DESC, created_at DESC");
-  const userRows = await all(
-    db,
-    `SELECT id, name, username, role, note, active,
-            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-       FROM users
-      ORDER BY name`
-  );
-
-  return {
-    ok: true,
-    config: {
-      baseDate: cfg.baseDate || "2026-05-01",
-      prealertDays: Number(cfg.prealertDays || 7),
-      site: cfg.site || "Planta Sales",
-      masterSystem: cfg.masterSystem || "SAP",
-      supportSystem: cfg.supportSystem || "Cloudflare D1",
-    },
-    equipment: equipmentRows.map(equipment),
-    routines: routineRows.map(routine),
-    planAssignments: planRows.map(assignment),
-    records: recordRows.map(record),
-    users: userRows.map(user),
-    accessRequests: await listAccessRequests(db),
-  };
-}
-
-async function saveRecord(db, data) {
-  const id = data.id || makeId("REG");
-  const createdAt = data.createdAt || new Date().toISOString();
-  await run(
-    db,
-    `INSERT OR REPLACE INTO execution_records (
-      id, equipment_id, equipment_code, routine_id, routine_code, date, time, shift,
-      technician, status, hourmeter, lubricant, quantity, loto, oil_condition,
-      sap_notice, sap_order, evidence, supervisor, findings, action, close_date,
-      observations, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      data.equipmentId || "",
-      data.equipmentCode || "",
-      data.routineId || "",
-      data.routineCode || "",
-      data.date || "",
-      data.time || "",
-      data.shift || "",
-      data.technician || "",
-      data.status || "",
-      data.hourmeter || "",
-      data.lubricant || "",
-      data.quantity || "",
-      data.loto || "",
-      data.oilCondition || "",
-      data.sapNotice || "",
-      data.sapOrder || "",
-      data.evidence || "",
-      data.supervisor || "",
-      data.findings || "",
-      data.action || "",
-      data.closeDate || "",
-      data.observations || "",
-      createdAt,
-    ]
-  );
-  return { ...data, id, createdAt };
-}
-
-async function saveUser(db, data) {
-  const id = data.id || makeId("USR");
-  const username = String(data.username || "").trim().toLowerCase();
-  if (!username || !data.name || !data.pin) throw new Error("Nombre, usuario y PIN son requeridos");
-
-  const existing = await first(db, "SELECT * FROM users WHERE id = ? OR lower(username) = ?", [id, username]);
-  const authorizedDeviceId = data.authorizedDeviceId ?? existing?.authorized_device_id ?? "";
-  const authorizedDeviceLabel = data.authorizedDeviceLabel ?? existing?.authorized_device_label ?? "";
-  const authorizedDeviceAt = data.authorizedDeviceAt ?? existing?.authorized_device_at ?? "";
-  const lastLoginAt = existing?.last_login_at || "";
-
-  await run(
-    db,
-    `INSERT OR REPLACE INTO users (
-      id, name, username, pin, role, note, active,
-      authorized_device_id, authorized_device_label, authorized_device_at, last_login_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      data.name || "",
-      username,
-      data.pin || "",
-      data.role || "tecnico",
-      data.note || "",
-      data.active === false ? 0 : 1,
-      authorizedDeviceId,
-      authorizedDeviceLabel,
-      authorizedDeviceAt,
-      lastLoginAt,
-      new Date().toISOString(),
-    ]
-  );
-
-  const row = await first(
-    db,
-    `SELECT id, name, username, role, note, active,
-            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-       FROM users WHERE id = ?`,
-    [id]
-  );
-  return user(row);
-}
-
-async function login(db, data) {
-  const username = String(data.username || "").trim().toLowerCase();
-  const pin = String(data.pin || "").trim();
-  const deviceId = String(data.deviceId || "").trim();
-  const deviceLabel = String(data.deviceLabel || "Equipo sin identificar").slice(0, 180);
-
-  const row = await first(db, "SELECT * FROM users WHERE lower(username) = ? AND pin = ? AND active = 1", [username, pin]);
-  if (!row) return { response: error("Usuario o PIN incorrecto", 401) };
-
-  const now = new Date().toISOString();
-
-  if (row.role !== "admin") {
-    if (!deviceId) {
-      return { response: error("No se pudo identificar este equipo", 400, { code: "DEVICE_REQUIRED" }) };
-    }
-
-    if (!row.authorized_device_id) {
-      await run(
-        db,
-        `UPDATE users
-            SET authorized_device_id = ?, authorized_device_label = ?, authorized_device_at = ?, last_login_at = ?, updated_at = ?
-          WHERE id = ?`,
-        [deviceId, deviceLabel, now, now, now, row.id]
-      );
-      await logDeviceEvent(db, {
-        userId: row.id,
-        username: row.username,
-        deviceId,
-        deviceLabel,
-        eventType: "AUTHORIZED_FIRST_DEVICE",
-        detail: "Primer ingreso: dispositivo vinculado automáticamente.",
-      });
-    } else if (row.authorized_device_id !== deviceId) {
-      await logDeviceEvent(db, {
-        userId: row.id,
-        username: row.username,
-        deviceId,
-        deviceLabel,
-        eventType: "DENIED_DIFFERENT_DEVICE",
-        detail: `Intento desde equipo diferente. Equipo autorizado: ${row.authorized_device_label || row.authorized_device_id}`,
-      });
-      return {
-        response: error("Usuario autorizado en otro equipo", 403, {
-          code: "DEVICE_LOCKED",
-          username: row.username,
-          authorizedDeviceLabel: row.authorized_device_label || "Equipo autorizado previamente",
-          authorizedDeviceAt: row.authorized_device_at || "",
-        }),
-      };
-    } else {
-      await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
-      await logDeviceEvent(db, {
-        userId: row.id,
-        username: row.username,
-        deviceId,
-        deviceLabel,
-        eventType: "LOGIN_OK",
-        detail: "Ingreso desde equipo autorizado.",
-      });
-    }
-  } else {
-    await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
+export async function onRequest({request,env}) {
+ try{
+  const db=env.DB;if(!db)fail('Falta configurar la base D1',503);
+  const url=new URL(request.url),path=url.pathname.replace(/\/$/,''),method=request.method;
+  if(!['GET','POST','PUT'].includes(method))fail('Método no permitido',405);
+  if(method!=='GET'&&request.headers.get('origin')!==url.origin)fail('Origen no permitido',403);
+  if(path==='/api/health'&&method==='GET'){await first(db,"SELECT value FROM mp_meta WHERE key='version'");return json({ok:true,app:'cmms-lubricacion',version:'actualizacion-multiplanta-v1',d1:true});}
+  if(path==='/api/setup')fail('Esta es una actualización. Utiliza los usuarios existentes.',409);
+  if(['/api/login','/api/auth/login','/api/auth/request-access'].includes(path)&&method==='POST'){
+   const b=await body(request);const result=await authenticateLegacy(db,request,b,path.endsWith('request-access')?'device':'password',hash,equal,digest);
+   if(result.pending)return json({ok:true,status:'PENDING'},202);
+   const token=hex(crypto.getRandomValues(new Uint8Array(32)));
+   await db.batch([stmt(db,'DELETE FROM mp_sessions WHERE expires_at<?',[Date.now()]),stmt(db,'INSERT INTO mp_sessions(token_hash,user_id,expires_at,device_id) VALUES (?,?,?,?)',[await digest(token),result.user.id,Date.now()+28800000,result.deviceId])]);
+   return json({ok:true,status:'APPROVED',user:publicUser(result.user)},200,{'Set-Cookie':cookie(token)});
   }
-
-  const updated = await first(
-    db,
-    `SELECT id, name, username, role, note, active,
-            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-       FROM users WHERE id = ?`,
-    [row.id]
-  );
-  return { user: user(updated) };
-}
-
-
-async function requestAccess(db, data) {
-  await ensureAccessRequestsSchema(db);
-  const requestedName = String(data.name || data.username || "").trim().replace(/\s+/g, " ");
-  const username = normalizeUsername(data.username || requestedName);
-  const deviceId = String(data.deviceId || "").trim();
-  const deviceLabel = String(data.deviceLabel || "Equipo sin identificar").slice(0, 180);
-
-  if (!requestedName || !username) {
-    return { response: error("Nombre de usuario requerido", 400, { code: "NAME_REQUIRED" }) };
+  const user=await identity(request,db);
+  if(path==='/api/logout'&&method==='POST'){const token=request.headers.get('cookie').match(/mp_session=([a-f0-9]{64})/)[1];await stmt(db,'DELETE FROM mp_sessions WHERE token_hash=?',[await digest(token)]).run();return json({ok:true},200,{'Set-Cookie':cookie('',0)});}
+  if(path==='/api/me'&&method==='GET'){
+   const plants=user.role==='admin'?await rows(db,'SELECT * FROM mp_plants ORDER BY name'):await rows(db,'SELECT p.* FROM mp_plants p WHERE EXISTS(SELECT 1 FROM mp_access a WHERE a.plant_id=p.id AND a.user_id=?) ORDER BY name',[user.id]);
+   const grants=user.role==='admin'?plants.flatMap(p=>modules.map(module=>({plant_id:p.id,module,permission:'edicion'}))):await rows(db,'SELECT plant_id,module,permission FROM mp_access WHERE user_id=?',[user.id]);
+   const techGrants=user.role==='admin'?[]:await rows(db,'SELECT plant_id,technique,permission FROM mp_tech_access WHERE user_id=?',[user.id]);
+   return json({user:publicUser(user),plants,grants,techGrants});
   }
-  if (!deviceId) {
-    return { response: error("No se pudo identificar este equipo", 400, { code: "DEVICE_REQUIRED" }) };
+  if(path.startsWith('/api/admin/')){
+   admin(user);
+   if(path==='/api/admin/state'&&method==='GET')return json({users:(await rows(db,'SELECT id,username,name,role,active,authorized_device_label,authorized_device_at FROM users ORDER BY name')).map(publicUser),plants:await rows(db,'SELECT * FROM mp_plants ORDER BY name'),grants:await rows(db,'SELECT * FROM mp_access'),lubActions:await rows(db,'SELECT * FROM mp_lub_actions'),techGrants:await rows(db,'SELECT * FROM mp_tech_access'),requests:await rows(db,'SELECT id,requested_name,username,device_label,status,created_at FROM access_requests ORDER BY created_at DESC')});
+   const b=method==='GET'?{}:await body(request);
+   if(path==='/api/admin/plants'&&method==='POST'){const plant=id(),name=str(b.name,'nombre de planta',150,true).toUpperCase();if(await first(db,'SELECT id FROM mp_plants WHERE upper(name)=?',[name]))fail('Ya existe una planta con ese nombre',409);await db.batch([stmt(db,'INSERT INTO mp_plants(id,name,created_at) VALUES (?,?,?)',[plant,name,now()]),audit(db,user,'crear_planta',plant,plant)]);return json({id:plant},201);}
+   if(path==='/api/admin/lub-actions'&&method==='PUT'){
+    const target=await first(db,"SELECT id FROM users WHERE id=? AND role!='admin'",[b.userId]);if(!target||!await first(db,'SELECT id FROM mp_plants WHERE id=?',[b.plantId]))fail('Usuario o planta inválidos');
+    if(!Array.isArray(b.actions)||b.actions.some(a=>!lubricationActions.includes(a)))fail('Acciones inválidas');
+    await db.batch([stmt(db,'INSERT INTO mp_lub_actions(user_id,plant_id,actions) VALUES (?,?,?) ON CONFLICT(user_id,plant_id) DO UPDATE SET actions=excluded.actions',[b.userId,b.plantId,JSON.stringify([...new Set(b.actions)])]),audit(db,user,'permisos_lubricacion',b.plantId,b.userId)]);return json({ok:true});
+   }
+   if(path==='/api/admin/tech-access'&&method==='PUT'){
+    const target=await first(db,"SELECT id FROM users WHERE id=? AND role!='admin'",[b.userId]);if(!target||!await first(db,'SELECT id FROM mp_plants WHERE id=?',[b.plantId])||!techniques.includes(b.technique)||!['ninguno','lectura','edicion'].includes(b.permission))fail('Permiso de técnica inválido');
+    await db.batch([stmt(db,'INSERT INTO mp_tech_access(user_id,plant_id,technique,permission) VALUES (?,?,?,?) ON CONFLICT(user_id,plant_id,technique) DO UPDATE SET permission=excluded.permission',[b.userId,b.plantId,b.technique,b.permission]),audit(db,user,`tecnica_${b.technique}_${b.permission}`,b.plantId,b.userId)]);return json({ok:true});
+   }
+   if(path==='/api/admin/request'&&method==='PUT'){
+    await approveRequest(db,b.requestId,b.decision,user.id);return json({ok:true});
+   }
+   if(path==='/api/admin/release-device'&&method==='PUT'){
+    const target=await first(db,'SELECT * FROM users WHERE id=?',[b.userId]);if(!target||target.role==='admin')fail('Usuario inválido');
+    await db.batch([stmt(db,"UPDATE users SET authorized_device_id='',authorized_device_label='',authorized_device_at='',updated_at=? WHERE id=?",[now(),b.userId]),stmt(db,'DELETE FROM mp_sessions WHERE user_id=?',[b.userId]),audit(db,user,'liberar_dispositivo',null,b.userId)]);return json({ok:true});
+   }
+   if(path==='/api/admin/users'&&method==='POST'){
+    const username=str(b.username,'usuario',80,true).toLowerCase(),name=str(b.name,'nombre',150,true),password=str(b.password,'contraseña',200,true);if(password.length<12)fail('Contraseña nueva: mínimo 12 caracteres');
+    if(await first(db,'SELECT id FROM users WHERE lower(username)=?',[username]))fail('El usuario ya existe',409);
+    const role=b.role||'tecnico';if(!['tecnico','supervisor','consulta'].includes(role))fail('Rol inválido');
+    const salt=id(),uid=id();await db.batch([
+     stmt(db,"INSERT INTO users(id,username,name,pin,role,created_at,updated_at) VALUES (?,?,?,'',?,?,?)",[uid,username,name,role,now(),now()]),
+     stmt(db,'INSERT INTO mp_credentials(user_id,password_hash,salt) VALUES (?,?,?)',[uid,await hash(password,salt),salt]),
+     audit(db,user,'crear_usuario',null,uid)]);return json({id:uid},201);
+   }
+   if(path==='/api/admin/user-profile'&&method==='PUT'){
+    const target=await first(db,'SELECT * FROM users WHERE id=?',[b.userId]);if(!target)fail('Usuario inválido');
+    const name=str(b.name,'nombre',150,true),username=str(b.username,'usuario',80,true).toLowerCase(),role=b.role||target.role;
+    if(target.role==='admin'?role!=='admin':!['tecnico','supervisor','consulta'].includes(role))fail('No se puede cambiar la condición de administrador desde este formulario');
+    const duplicate=await first(db,'SELECT id FROM users WHERE lower(username)=? AND id!=?',[username,target.id]);if(duplicate)fail('Ya existe ese usuario',409);
+    const ops=[stmt(db,'UPDATE users SET name=?,username=?,role=?,updated_at=? WHERE id=?',[name,username,role,now(),target.id]),audit(db,user,'editar_usuario',null,target.id)];
+    if(b.password){const password=str(b.password,'contraseña',200,true);if(password.length<12)fail('La nueva contraseña requiere 12 caracteres');const salt=id();ops.push(stmt(db,'INSERT INTO mp_credentials(user_id,password_hash,salt) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET password_hash=excluded.password_hash,salt=excluded.salt',[target.id,await hash(password,salt),salt]));ops.push(stmt(db,'DELETE FROM mp_sessions WHERE user_id=?',[target.id]));}
+    await db.batch(ops);return json({ok:true});
+   }
+   if(path==='/api/admin/access'&&method==='PUT'){
+    const target=await first(db,'SELECT * FROM users WHERE id=?',[b.userId]);if(!target||target.role==='admin')fail('Selecciona un usuario no administrador');
+    if(!await first(db,'SELECT id FROM mp_plants WHERE id=?',[b.plantId])||!modules.includes(b.module))fail('Planta o módulo inválido');
+    if(!['ninguno','lectura','edicion'].includes(b.permission))fail('Permiso inválido');
+    const operation=b.permission==='ninguno'?stmt(db,'DELETE FROM mp_access WHERE user_id=? AND plant_id=? AND module=?',[b.userId,b.plantId,b.module]):stmt(db,'INSERT INTO mp_access(user_id,plant_id,module,permission) VALUES (?,?,?,?) ON CONFLICT(user_id,plant_id,module) DO UPDATE SET permission=excluded.permission',[b.userId,b.plantId,b.module,b.permission]);
+    await db.batch([operation,audit(db,user,`acceso_${b.module}_${b.permission}`,b.plantId,b.userId)]);return json({ok:true});
+   }
+   if(path==='/api/admin/user-status'&&method==='PUT'){
+    const target=await first(db,'SELECT * FROM users WHERE id=?',[b.userId]);if(!target||target.role==='admin')fail('No se puede desactivar el administrador desde esta pantalla');if(typeof b.active!=='boolean')fail('Estado inválido');
+    await db.batch([stmt(db,'UPDATE users SET active=? WHERE id=?',[b.active?1:0,b.userId]),stmt(db,'DELETE FROM mp_sessions WHERE user_id=?',[b.userId]),audit(db,user,b.active?'activar_usuario':'desactivar_usuario',null,b.userId)]);return json({ok:true});
+   }
+   fail('Ruta no encontrada',404);
   }
-  if (["admin", "administrador"].includes(username)) {
-    return { response: error("El administrador debe ingresar con PIN", 400, { code: "ADMIN_PIN_REQUIRED" }) };
+  if(path==='/api/measurement-equipment'&&method==='GET'){
+   const plant=url.searchParams.get('plant');await access(db,user,plant,'medicion');
+   return json({equipment:(await equipmentCatalog(db,plant)).map(e=>({id:e.id,code:e.code,name:e.name,area:e.area||'',active:e.active!==false&&e.active!==0}))});
   }
-
-  const now = new Date().toISOString();
-  const row = await first(
-    db,
-    "SELECT * FROM users WHERE active = 1 AND (lower(username) = ? OR lower(name) = ?) LIMIT 1",
-    [username, username]
-  );
-
-  if (row) {
-    if (row.role === "admin") {
-      return { response: error("El administrador debe ingresar con PIN", 400, { code: "ADMIN_PIN_REQUIRED" }) };
-    }
-
-    if (row.authorized_device_id && row.authorized_device_id === deviceId) {
-      await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
-      await logDeviceEvent(db, {
-        userId: row.id,
-        username: row.username,
-        deviceId,
-        deviceLabel,
-        eventType: "LOGIN_OK_NAME_ONLY",
-        detail: "Ingreso por nombre desde equipo autorizado.",
-      });
-      const updated = await first(
-        db,
-        `SELECT id, name, username, role, note, active,
-                authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-           FROM users WHERE id = ?`,
-        [row.id]
-      );
-      return { status: "APPROVED", user: user(updated) };
-    }
-
-    if (row.authorized_device_id && row.authorized_device_id !== deviceId) {
-      await logDeviceEvent(db, {
-        userId: row.id,
-        username: row.username,
-        deviceId,
-        deviceLabel,
-        eventType: "DENIED_DIFFERENT_DEVICE_NAME_ONLY",
-        detail: `Intento por nombre desde equipo diferente. Equipo autorizado: ${row.authorized_device_label || row.authorized_device_id}`,
-      });
-      return {
-        response: error("Usuario autorizado en otro equipo", 403, {
-          code: "DEVICE_LOCKED",
-          username: row.username,
-          authorizedDeviceLabel: row.authorized_device_label || "Equipo autorizado previamente",
-          authorizedDeviceAt: row.authorized_device_at || "",
-        }),
-      };
-    }
-
-    const existing = await first(
-      db,
-      "SELECT * FROM access_requests WHERE user_id = ? AND device_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
-      [row.id, deviceId]
-    );
-    if (!existing) {
-      await run(
-        db,
-        `INSERT INTO access_requests (id, requested_name, username, device_id, device_label, status, user_id, role, detail, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
-        [makeId("REQ"), requestedName, row.username, deviceId, deviceLabel, row.id, row.role || "consulta", "Pendiente de autorización del administrador.", now, now]
-      );
-    }
-    return { status: "PENDING", accessRequests: await listAccessRequests(db) };
+  if(path.startsWith('/api/lubrication/')){
+   const plantId=url.searchParams.get('plant');const permission=await access(db,user,plantId,'lubricacion');
+   const plantRow=await first(db,'SELECT name FROM mp_plants WHERE id=?',[plantId]);
+   const legacy=plantId==='HIPOCALCIO'?await readLegacy(db):null;
+   const stored=legacy?{revision:legacy.revision}:await first(db,'SELECT * FROM mp_lubrication WHERE plant_id=?',[plantId]);
+   const saved=legacy?legacy.state:stored?JSON.parse(stored.data):emptyState(plantRow.name);
+   const custom=await first(db,'SELECT actions FROM mp_lub_actions WHERE user_id=? AND plant_id=?',[user.id,plantId]);
+   const allowed=user.role==='admin'?lubricationActions:permission==='lectura'?(custom?JSON.parse(custom.actions).filter(a=>a==='export'):['export']):(custom?JSON.parse(custom.actions):['record','editMaster','export']);
+   if(path==='/api/lubrication/bootstrap'&&method==='GET')return json({...saved,revision:stored?.revision||0,plantId,user:publicUser(user),actions:allowed});
+   if(path==='/api/lubrication/state'&&method==='POST'){
+    if(user.role!=='admin'&&permission!=='edicion')fail('Solo lectura',403);
+    const b=await body(request);if(b.revision!==(stored?.revision||0))fail('Otro usuario modificó esta planta. Recarga antes de guardar.',409);
+    const next=cleanState(b.state,plantRow.name);authorizeChanges(saved,next,allowed);
+    if(legacy){const revision=await saveLegacy(db,saved,next,b.revision,{userId:user.id});return json({ok:true,revision});}
+    if(stored){const result=await stmt(db,'UPDATE mp_lubrication SET data=?,revision=revision+1,updated_at=? WHERE plant_id=? AND revision=?',[JSON.stringify(next),now(),plantId,b.revision]).run();if(result.meta.changes!==1)fail('Los datos cambiaron. Recarga.',409);}
+    else await stmt(db,'INSERT INTO mp_lubrication(plant_id,data,revision,updated_at) VALUES (?,?,1,?)',[plantId,JSON.stringify(next),now()]).run();
+    await audit(db,user,'guardar_lubricacion',plantId,plantId).run();return json({ok:true,revision:(stored?.revision||0)+1});
+   }
+   if(path==='/api/lubrication/import')fail('HIPOCALCIO utiliza directamente la base existente. No se importa ni reemplaza desde JSON.',409);
+   fail('Ruta de lubricación no disponible',404);
   }
-
-  const existing = await first(
-    db,
-    "SELECT * FROM access_requests WHERE lower(username) = ? AND device_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
-    [username, deviceId]
-  );
-  if (!existing) {
-    await run(
-      db,
-      `INSERT INTO access_requests (id, requested_name, username, device_id, device_label, status, role, detail, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', 'consulta', ?, ?, ?)`,
-      [makeId("REQ"), requestedName, username, deviceId, deviceLabel, "Usuario no existente; al aprobar se creará como consulta.", now, now]
-    );
+  if(path==='/api/items'&&(method==='GET'||method==='POST')){
+   const plant=url.searchParams.get('plant'),kind=url.searchParams.get('kind');if(!kinds.includes(kind))fail('Tipo inválido');
+   const permission=await access(db,user,plant,kind==='medicion'?'medicion':'lubricacion',method==='POST');
+   const overrides=kind==='medicion'&&user.role!=='admin'?await rows(db,'SELECT technique,permission FROM mp_tech_access WHERE user_id=? AND plant_id=?',[user.id,plant]):[];
+   if(method==='GET')return json({permission,items:(await rows(db,'SELECT * FROM mp_items WHERE plant_id=? AND kind=? ORDER BY updated_at DESC',[plant,kind])).map(r=>({...r,data:JSON.parse(r.data)})).filter(r=>!overrides.some(g=>g.technique===r.data.technique&&g.permission==='ninguno'))});
+   const b=await body(request),data=validate(kind,b.data);
+   if(overrides.some(g=>g.technique===data.technique&&g.permission!=='edicion'))fail('Sin permiso de registro para esta técnica',403);
+   if(kind==='ejecucion'){
+    const plan=await first(db,"SELECT data FROM mp_items WHERE id=? AND plant_id=? AND kind='plan'",[data.planId,plant]);if(!plan)fail('Rutina de otra planta o inexistente',403);if(JSON.parse(plan.data).equipment!==data.equipment)fail('El equipo no coincide con la rutina');
+   }
+   const itemId=b.id?str(b.id,'id',100,true):id(),old=await first(db,'SELECT * FROM mp_items WHERE id=?',[itemId]);
+   if(b.id&&!old)fail('Registro no disponible',404);if(old&&(old.plant_id!==plant||old.kind!==kind))fail('Registro de otra planta o módulo',403);
+   if(old&&kind==='medicion'&&JSON.parse(old.data).technique!==data.technique)fail('No se puede cambiar la técnica de un registro existente',403);
+   if(old&&b.revision!==old.revision)fail('Otro usuario modificó este registro. Recarga antes de editar.',409);
+   const previous=old?JSON.parse(old.data):null;
+   if(previous&&((previous.equipmentId&&previous.equipmentId===b.data.equipmentId)||(!previous.equipmentId&&!b.data.equipmentId&&previous.equipment===data.equipment))){
+    data.equipment=previous.equipment;if(previous.equipmentId)data.equipmentId=previous.equipmentId;
+   }else{
+    const chosen=(await equipmentCatalog(db,plant)).find(e=>e.id===b.data.equipmentId&&e.active!==false&&e.active!==0);
+    if(!chosen)fail('Selecciona un equipo activo del catálogo de esta planta',400);
+    data.equipmentId=chosen.id;data.equipment=chosen.code;
+   }
+   if(previous?.thermalPoints&&(!data.thermalPoints||previous.equipmentId!==data.equipmentId))fail('No se puede cambiar el equipo ni retirar los puntos de una inspección multipunto');
+   if(data.thermalPoints){
+    if(previous?.thermalPoints?.some(p=>!data.thermalPoints.some(n=>n.id===p.id)))fail('Conserva los puntos existentes; marca No medido si corresponde');
+    if(user.role!=='admin'){
+     const prior=previous?.thermalPoints?previous:(await rows(db,"SELECT data FROM mp_items WHERE plant_id=? AND kind='medicion' ORDER BY updated_at DESC",[plant])).map(r=>JSON.parse(r.data)).find(d=>d.technique==='Termografía'&&d.equipmentId===data.equipmentId&&d.thermalPoints);
+     for(const p of data.thermalPoints){const c=prior?.thermalPoints.find(x=>x.id===p.id)?.criteria||null;if(JSON.stringify(p.criteria)!==JSON.stringify(c))fail('Solo el administrador puede aprobar o cambiar criterios térmicos',403);}
+    }
+   }
+   if(old){const result=await stmt(db,'UPDATE mp_items SET data=?,revision=revision+1,updated_at=? WHERE id=? AND plant_id=? AND revision=?',[JSON.stringify(data),now(),itemId,plant,b.revision]).run();if(result.meta.changes!==1)fail('El registro cambió. Recarga.',409);await audit(db,user,`editar_${kind}`,plant,itemId).run();}
+   else await db.batch([stmt(db,'INSERT INTO mp_items(id,plant_id,kind,data,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',[itemId,plant,kind,JSON.stringify(data),user.id,now(),now()]),audit(db,user,`crear_${kind}`,plant,itemId)]);
+   return json({ok:true,id:itemId},old?200:201);
   }
-  return { status: "PENDING", accessRequests: await listAccessRequests(db) };
-}
-
-async function approveAccessRequest(db, id, data = {}) {
-  await ensureAccessRequestsSchema(db);
-  const req = await first(db, "SELECT * FROM access_requests WHERE id = ?", [id]);
-  if (!req) throw new Error("Solicitud no encontrada");
-  if (req.status !== "pending") return { request: accessRequest(req), accessRequests: await listAccessRequests(db) };
-
-  const now = new Date().toISOString();
-  const requestedName = String(req.requested_name || req.username || "Usuario autorizado").trim();
-  const username = normalizeUsername(req.username || requestedName);
-  const role = String(data.role || req.role || "consulta").trim() || "consulta";
-
-  let existingUser = req.user_id ? await first(db, "SELECT * FROM users WHERE id = ?", [req.user_id]) : null;
-  if (!existingUser) {
-    existingUser = await first(db, "SELECT * FROM users WHERE lower(username) = ? OR lower(name) = ? LIMIT 1", [username, username]);
-  }
-
-  let userId;
-  if (existingUser) {
-    userId = existingUser.id;
-    await run(
-      db,
-      `UPDATE users
-          SET active = 1,
-              authorized_device_id = ?, authorized_device_label = ?, authorized_device_at = ?, updated_at = ?
-        WHERE id = ?`,
-      [req.device_id, req.device_label || "", now, now, userId]
-    );
-  } else {
-    userId = makeId("USR");
-    await run(
-      db,
-      `INSERT INTO users (id, name, username, pin, role, note, active,
-                          authorized_device_id, authorized_device_label, authorized_device_at, last_login_at, created_at, updated_at)
-       VALUES (?, ?, ?, '', ?, ?, 1, ?, ?, ?, '', ?, ?)`,
-      [userId, requestedName, username, role, "Creado por solicitud de acceso aprobada.", req.device_id, req.device_label || "", now, now, now]
-    );
-  }
-
-  await run(
-    db,
-    "UPDATE access_requests SET status = 'approved', user_id = ?, detail = ?, updated_at = ? WHERE id = ?",
-    [userId, "Solicitud aprobada por administrador.", now, id]
-  );
-  await logDeviceEvent(db, {
-    userId,
-    username,
-    deviceId: req.device_id,
-    deviceLabel: req.device_label || "",
-    eventType: "ACCESS_REQUEST_APPROVED",
-    detail: "Equipo autorizado por solicitud de acceso.",
-  });
-
-  const updated = await first(
-    db,
-    `SELECT id, name, username, role, note, active,
-            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-       FROM users WHERE id = ?`,
-    [userId]
-  );
-  return { user: user(updated), accessRequests: await listAccessRequests(db) };
-}
-
-async function denyAccessRequest(db, id) {
-  await ensureAccessRequestsSchema(db);
-  const req = await first(db, "SELECT * FROM access_requests WHERE id = ?", [id]);
-  if (!req) throw new Error("Solicitud no encontrada");
-  const now = new Date().toISOString();
-  await run(db, "UPDATE access_requests SET status = 'denied', detail = ?, updated_at = ? WHERE id = ?", ["Solicitud negada por administrador.", now, id]);
-  return { accessRequests: await listAccessRequests(db) };
-}
-
-async function releaseDevice(db, id) {
-  const row = await first(db, "SELECT * FROM users WHERE id = ?", [id]);
-  if (!row) throw new Error("Usuario no encontrado");
-  const now = new Date().toISOString();
-  await run(
-    db,
-    `UPDATE users
-        SET authorized_device_id = '', authorized_device_label = '', authorized_device_at = '', updated_at = ?
-      WHERE id = ?`,
-    [now, id]
-  );
-  await logDeviceEvent(db, {
-    userId: row.id,
-    username: row.username,
-    deviceId: row.authorized_device_id || "",
-    deviceLabel: row.authorized_device_label || "",
-    eventType: "RELEASED_BY_ADMIN",
-    detail: "Equipo liberado desde el módulo Usuarios.",
-  });
-  const updated = await first(
-    db,
-    `SELECT id, name, username, role, note, active,
-            authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-       FROM users WHERE id = ?`,
-    [id]
-  );
-  return user(updated);
-}
-
-export async function onRequest({ request, env }) {
-  try {
-    const db = requireDb(env);
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-    const method = request.method.toUpperCase();
-
-    if (method === "GET" && path === "/api/health") {
-      return json({ ok: true, app: "cmms-lubricacion", d1: Boolean(env.DB), timestamp: new Date().toISOString() });
-    }
-
-    if (method === "GET" && path === "/api/bootstrap") return json(await bootstrap(db));
-
-    if (method === "POST" && path === "/api/auth/login") {
-      const result = await login(db, await bodyJson(request));
-      if (result.response) return result.response;
-      return json({ ok: true, user: result.user });
-    }
-
-    if (method === "POST" && path === "/api/auth/request-access") {
-      const result = await requestAccess(db, await bodyJson(request));
-      if (result.response) return result.response;
-      return json({ ok: true, ...result }, result.status === "PENDING" ? 202 : 200);
-    }
-
-    if (method === "GET" && path === "/api/access-requests") {
-      return json({ ok: true, accessRequests: await listAccessRequests(db) });
-    }
-
-    if (method === "POST" && path.startsWith("/api/access-requests/") && path.endsWith("/approve")) {
-      const id = decodeURIComponent(path.split("/")[3]);
-      return json({ ok: true, ...(await approveAccessRequest(db, id, await bodyJson(request))) });
-    }
-
-    if (method === "POST" && path.startsWith("/api/access-requests/") && path.endsWith("/deny")) {
-      const id = decodeURIComponent(path.split("/")[3]);
-      return json({ ok: true, ...(await denyAccessRequest(db, id)) });
-    }
-
-    if (method === "GET" && path === "/api/equipment") {
-      return json({ ok: true, equipment: (await all(db, "SELECT * FROM equipment ORDER BY code")).map(equipment) });
-    }
-
-    if (method === "GET" && path === "/api/routines") {
-      return json({ ok: true, routines: (await all(db, "SELECT * FROM routines ORDER BY code")).map(routine) });
-    }
-
-    if (method === "GET" && path === "/api/plan") {
-      return json({ ok: true, planAssignments: (await all(db, "SELECT * FROM plan_assignments ORDER BY id")).map(assignment) });
-    }
-
-    if (method === "GET" && path === "/api/records") {
-      return json({ ok: true, records: (await all(db, "SELECT * FROM execution_records ORDER BY date DESC, created_at DESC")).map(record) });
-    }
-
-    if (method === "POST" && path === "/api/records") {
-      return json({ ok: true, record: await saveRecord(db, await bodyJson(request)) }, 201);
-    }
-
-    if (method === "DELETE" && path.startsWith("/api/records/")) {
-      const id = decodeURIComponent(path.split("/").pop());
-      await run(db, "DELETE FROM execution_records WHERE id = ?", [id]);
-      return json({ ok: true, id });
-    }
-
-    if (method === "GET" && path === "/api/users") {
-      return json({
-        ok: true,
-        users: (await all(
-          db,
-          `SELECT id, name, username, role, note, active,
-                  authorized_device_id, authorized_device_label, authorized_device_at, last_login_at
-             FROM users
-            ORDER BY name`
-        )).map(user),
-      });
-    }
-
-    if (method === "POST" && path === "/api/users") {
-      return json({ ok: true, user: await saveUser(db, await bodyJson(request)) }, 201);
-    }
-
-    if (method === "POST" && path.startsWith("/api/users/") && path.endsWith("/release-device")) {
-      const id = decodeURIComponent(path.split("/")[3]);
-      return json({ ok: true, user: await releaseDevice(db, id) });
-    }
-
-    if (method === "DELETE" && path.startsWith("/api/users/")) {
-      const id = decodeURIComponent(path.split("/").pop());
-      await run(db, "DELETE FROM users WHERE id = ?", [id]);
-      return json({ ok: true, id });
-    }
-
-    return error("Ruta API no encontrada", 404);
-  } catch (err) {
-    return error(err.message || "Error interno", 500);
-  }
+  fail('Ruta no encontrada',404);
+ }catch(error){if(!error.status)console.error(error);return json({error:error.status?error.message:'Error interno. Revisa la configuración y el registro del servidor.'},error.status||500);}
 }
