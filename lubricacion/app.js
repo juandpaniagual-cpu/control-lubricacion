@@ -773,8 +773,10 @@
       if(saving)return;
       if (!requireAction("editMaster")) return;
       const id = $("#equipmentId").value || uid("EQ");
+      let thermalConfig;try{thermalConfig=window.thermalEquipment.read();}catch(error){toast(error.message);return;}
       const equipment = {
         id,
+        thermalConfig,
         code: $("#equipmentCode").value.trim(),
         name: $("#equipmentName").value.trim(),
         area: $("#equipmentArea").value.trim(),
@@ -869,6 +871,7 @@
         $("#equipmentFamily").value = equipment.family || "General";
         $("#equipmentCriticality").value = equipment.criticality || "Media";
         $("#equipmentCostCenter").value = equipment.costCenter || "";
+        window.thermalEquipment.load(equipment.thermalConfig);
         toast("Equipo cargado para edición.");
       }
 

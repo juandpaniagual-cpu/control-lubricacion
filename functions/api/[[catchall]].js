@@ -1,6 +1,7 @@
 import {failureModes,diagnosticStates} from '../../vibration.js';
 import {validateThermal,thermalSummary} from '../../thermal.js';
 import {readLegacy,saveLegacy} from '../../lib/legacy-storage.js';
+import {withThermalHistory,parseThermalConfig} from '../../lib/thermal-config.js';
 import {authenticateLegacy,approveRequest} from '../../lib/legacy-auth.js';
 import {actions as lubricationActions,emptyState,cleanState,authorizeChanges} from '../../lib/lubrication.js';
 const modules = ['lubricacion','medicion'];
@@ -16,7 +17,7 @@ const rows = async(db,sql,args=[]) => (await stmt(db,sql,args).all()).results ||
 async function equipmentCatalog(db,plant){
  if(plant==='HIPOCALCIO')return (await readLegacy(db)).state.equipment;
  const saved=await first(db,'SELECT data FROM mp_lubrication WHERE plant_id=?',[plant]);
- return saved?(JSON.parse(saved.data).equipment||[]):[];
+ return withThermalHistory(db,plant,saved?(JSON.parse(saved.data).equipment||[]):[]);
 }
 const encode = value => new TextEncoder().encode(value);
 const hex = buffer => Array.from(new Uint8Array(buffer),v=>v.toString(16).padStart(2,'0')).join('');
@@ -160,7 +161,7 @@ export async function onRequest({request,env}) {
   }
   if(path==='/api/measurement-equipment'&&method==='GET'){
    const plant=url.searchParams.get('plant');await access(db,user,plant,'medicion');
-   return json({equipment:(await equipmentCatalog(db,plant)).map(e=>({id:e.id,code:e.code,name:e.name,area:e.area||'',active:e.active!==false&&e.active!==0}))});
+   return json({equipment:(await equipmentCatalog(db,plant)).map(e=>({id:e.id,code:e.code,name:e.name,area:e.area||'',active:e.active!==false&&e.active!==0,thermalConfig:e.thermalConfig}))});
   }
   if(path.startsWith('/api/lubrication/')){
    const plantId=url.searchParams.get('plant');const permission=await access(db,user,plantId,'lubricacion');
@@ -168,6 +169,7 @@ export async function onRequest({request,env}) {
    const legacy=plantId==='HIPOCALCIO'?await readLegacy(db):null;
    const stored=legacy?{revision:legacy.revision}:await first(db,'SELECT * FROM mp_lubrication WHERE plant_id=?',[plantId]);
    const saved=legacy?legacy.state:stored?JSON.parse(stored.data):emptyState(plantRow.name);
+   if(!legacy)await withThermalHistory(db,plantId,saved.equipment);
    const custom=await first(db,'SELECT actions FROM mp_lub_actions WHERE user_id=? AND plant_id=?',[user.id,plantId]);
    const allowed=user.role==='admin'?lubricationActions:permission==='lectura'?(custom?JSON.parse(custom.actions).filter(a=>a==='export'):['export']):(custom?JSON.parse(custom.actions):['record','editMaster','export']);
    if(path==='/api/lubrication/bootstrap'&&method==='GET')return json({...saved,revision:stored?.revision||0,plantId,user:publicUser(user),actions:allowed});
@@ -207,6 +209,7 @@ export async function onRequest({request,env}) {
    }
    if(previous?.thermalPoints&&(!data.thermalPoints||previous.equipmentId!==data.equipmentId))fail('No se puede cambiar el equipo ni retirar los puntos de una inspección multipunto');
    if(data.thermalPoints){
+    if(!previous){const equipment=(await equipmentCatalog(db,plant)).find(e=>e.id===data.equipmentId);if(equipment?.thermalConfig!==undefined){const expected=parseThermalConfig(equipment.thermalConfig).filter(p=>p.active);if(expected.length!==data.thermalPoints.length||expected.some(p=>!data.thermalPoints.some(n=>n.id===p.id&&n.name===p.name)))fail('Los puntos del equipo cambiaron. Recarga y usa su configuración actual.');}}
     if(previous?.thermalPoints?.some(p=>!data.thermalPoints.some(n=>n.id===p.id)))fail('Conserva los puntos existentes; marca No medido si corresponde');
     if(user.role!=='admin'){
      const prior=previous?.thermalPoints?previous:(await rows(db,"SELECT data FROM mp_items WHERE plant_id=? AND kind='medicion' ORDER BY updated_at DESC",[plant])).map(r=>JSON.parse(r.data)).find(d=>d.technique==='Termografía'&&d.equipmentId===data.equipmentId&&d.thermalPoints);
