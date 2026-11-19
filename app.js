@@ -1,5 +1,6 @@
 import {failureModes,diagnosticStates} from './vibration.js';
 import {mountThermal,thermalHistory,thermalSummary} from './thermal.js';
+import {pointConfiguration} from './thermal-points.js';
 let thermalEditor=null;
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -76,7 +77,7 @@ function render(){const measurement=module==='medicion',visible=measurement?item
  ${measurement?'<p class="section-note">Registra la referencia y las condiciones de medición. El analista determina el diagnóstico; no se aplican umbrales automáticos.</p>':''}
  ${visible.length?`<div class="table-wrap"><table><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}<th>Detalle</th></tr></thead><tbody>${visible.map(i=>`<tr>${rowValues(i).map((v,n)=>`<td>${(measurement&&n===3)||(!measurement&&tab==='plan'&&n===6)?conditionBadge(v):esc(v)}</td>`).join('')}<td><button data-edit="${esc(i.id)}" class="secondary">${canWrite()?'Ver / editar':'Ver'}</button></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Aún no hay registros. Los datos pertenecen únicamente a esta planta.</div>'}`;
  if(measurement&&technique==='Análisis de aceite')$('#content').append(oilTrend(visible));
- if(measurement&&technique==='Termografía')$('#content').append(thermalHistory(visible,catalog));
+ if(measurement&&technique==='Termografía'){$('#content').insertBefore(pointConfiguration(catalog,canWrite(),(equipment,points)=>api('/thermal-points','PUT',{plantId:plant,equipmentId:equipment.id,revision:equipment.thermalRevision??null,points})),$('#content .section-note'));$('#content').append(thermalHistory(visible,catalog));}
  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{if(measurement)technique=b.dataset.tab;else{tab=b.dataset.tab;items=tab==='plan'?plans:executions;}render();});$('#reload').onclick=()=>load();$('#newItem')?.addEventListener('click',()=>edit());document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>edit(items.find(i=>i.id===b.dataset.edit)));
  $('#excel').onclick=async()=>{try{await load();if(!session)return;await api(query(measurement?'medicion':tab==='plan'?'plan':'ejecucion'));const filtered=measurement?items.filter(i=>i.data.technique===technique):items;if(!filtered.length){notice('No hay datos para exportar.');return;}const outputHeaders=[...headers,...(measurement?['Técnico','Referencia','Instrumento','Condiciones','SAP','Informe','Modo de falla','Estado del diagnóstico','Detalle de falla','Mediciones']:[])];const rows=filtered.map(i=>[...rowValues(i),...(measurement?[i.data.technician,i.data.reference,i.data.instrument,i.data.conditions,i.data.sap,i.data.evidence,i.data.failureMode||'',i.data.diagnosticState||'',i.data.failureDetail||'',(i.data.measurements||[]).map(m=>`${m.name}: ${m.value} ${m.unit}`).join('\n')]:[])]);window.exportWorkbook([outputHeaders,...rows],`${module}_${plant}_${today()}.xlsx`);}catch(e){notice(e.message);}};
 }

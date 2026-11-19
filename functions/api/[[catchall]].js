@@ -15,9 +15,11 @@ const stmt = (db,sql,args=[]) => db.prepare(sql).bind(...args);
 const first = (db,sql,args=[]) => stmt(db,sql,args).first();
 const rows = async(db,sql,args=[]) => (await stmt(db,sql,args).all()).results || [];
 async function equipmentCatalog(db,plant){
- if(plant==='HIPOCALCIO')return (await readLegacy(db)).state.equipment;
- const saved=await first(db,'SELECT data FROM mp_lubrication WHERE plant_id=?',[plant]);
- return withThermalHistory(db,plant,saved?(JSON.parse(saved.data).equipment||[]):[]);
+ let equipment;if(plant==='HIPOCALCIO')equipment=(await readLegacy(db)).state.equipment;
+ else{const saved=await first(db,'SELECT data FROM mp_lubrication WHERE plant_id=?',[plant]);equipment=await withThermalHistory(db,plant,saved?(JSON.parse(saved.data).equipment||[]):[]);}
+ const stored=await rows(db,'SELECT key,value FROM mp_meta WHERE key LIKE ?',['thermal-points:'+plant+':%']);
+ for(const e of equipment){const config=stored.find(r=>r.key==='thermal-points:'+plant+':'+e.id);e.thermalRevision=config?.value??null;if(config)e.thermalConfig=config.value;}
+ return equipment;
 }
 const encode = value => new TextEncoder().encode(value);
 const hex = buffer => Array.from(new Uint8Array(buffer),v=>v.toString(16).padStart(2,'0')).join('');
@@ -161,7 +163,18 @@ export async function onRequest({request,env}) {
   }
   if(path==='/api/measurement-equipment'&&method==='GET'){
    const plant=url.searchParams.get('plant');await access(db,user,plant,'medicion');
-   return json({equipment:(await equipmentCatalog(db,plant)).map(e=>({id:e.id,code:e.code,name:e.name,area:e.area||'',active:e.active!==false&&e.active!==0,thermalConfig:e.thermalConfig}))});
+   return json({equipment:(await equipmentCatalog(db,plant)).map(e=>({id:e.id,code:e.code,name:e.name,area:e.area||'',active:e.active!==false&&e.active!==0,thermalConfig:e.thermalConfig,thermalRevision:e.thermalRevision}))});
+  }
+  if(path==='/api/thermal-points'&&method==='PUT'){
+   const b=await body(request),plant=b.plantId;await access(db,user,plant,'medicion',true);
+   if(user.role!=='admin'){const permission=await first(db,"SELECT permission FROM mp_tech_access WHERE user_id=? AND plant_id=? AND technique='Termografía'",[user.id,plant]);if(permission&&permission.permission!=='edicion')fail('Sin permiso para configurar Termografía',403);}
+   const equipment=(await equipmentCatalog(db,plant)).find(e=>e.id===b.equipmentId&&e.active!==false&&e.active!==0);if(!equipment)fail('Equipo no disponible en esta planta');
+   const points=parseThermalConfig(JSON.stringify(b.points));if(!points.some(p=>p.active))fail('Conserva al menos un punto activo');
+   for(const old of equipment.thermalConfig?parseThermalConfig(equipment.thermalConfig):[])if(!points.some(p=>p.id===old.id))fail('Retira el punto anterior sin borrar su identidad');
+   const key='thermal-points:'+plant+':'+equipment.id,value=JSON.stringify(points);if(b.revision!==equipment.thermalRevision)fail('Otro usuario cambió los puntos. Recarga.',409);
+   const result=b.revision===null?await stmt(db,'INSERT OR IGNORE INTO mp_meta(key,value) VALUES (?,?)',[key,value]).run():await stmt(db,'UPDATE mp_meta SET value=? WHERE key=? AND value=?',[value,key,b.revision]).run();
+   if(Number(result.meta.changes)!==1)fail('Otro usuario cambió los puntos. Recarga.',409);
+   return json({ok:true});
   }
   if(path.startsWith('/api/lubrication/')){
    const plantId=url.searchParams.get('plant');const permission=await access(db,user,plantId,'lubricacion');
